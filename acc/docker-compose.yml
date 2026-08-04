@@ -1,0 +1,14 @@
+services:
+  db:
+    # 16 is the floor this tool supports; testing on the floor is what catches an accidental
+    # dependency on something newer
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
