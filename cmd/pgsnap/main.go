@@ -55,6 +55,7 @@ Configuration is read from the environment, reusing Nullstone's built-in names w
     SNAPSHOT            pin a snapshot timestamp (default: newest)
     BACKUP_RETENTION    previous versions of the target to keep (default %d)
     MIGRATE_COMMAND     command that migrates the staging database
+    RESTORE_REPLICATION carry the target's publications and slots (default on)
 `
 
 func main() {
@@ -180,6 +181,7 @@ func runRestore(ctx context.Context, log *slog.Logger) error {
 		Workers:         workers,
 		BackupRetention: retention,
 		MigrateCommand:  os.Getenv(migrateCommandEnvVar),
+		Replication:     boolEnv(replicationEnvVar, true),
 		Log:             log,
 	})
 	if err != nil {

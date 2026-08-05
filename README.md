@@ -181,6 +181,49 @@ rather than a read-modify-write, so it is safe to re-run.
 Customer-managed encryption needs no extra grant here, unlike on AWS. Cloud Storage decrypts with
 its own service agent, so the reader never touches the key.
 
+### Logical replication
+
+The swap replaces the target by renaming, and everything bound to the old database's OID goes with
+it. That includes the environment's replication setup, so a restore would otherwise break whatever
+was replicating out of it — Datastream, a warehouse feed, a downstream subscriber.
+
+Both halves are carried automatically. Set `RESTORE_REPLICATION=off` to skip it.
+
+**Publications** are copied from the target onto the staging database before the swap, using
+`pg_dump`, so `publish` parameters, `publish_via_partition_root`, column lists and row filters all
+survive exactly. This is the environment's *own* publication — production's are excluded from the
+snapshot entirely, because production's replication topology has no business running in a lower
+environment.
+
+It happens after your migration step. Applying a publication before migrations is destructive:
+dropping a published table silently removes it from the publication, and dropping a column named in
+a publication's column list fails outright, breaking the migration.
+
+A publication naming a table the restored schema does not have fails the restore *before* the swap,
+leaving the target untouched.
+
+**Replication slots** are recreated after the swap. A slot is bound to a database OID, so the rename
+leaves it pointing at the backup, and there is no operation that rebinds one — a consumer
+reconnecting to the target by name is told `replication slot "…" was not created in this database`.
+The restore drops the orphan and creates a fresh slot with the same name and plugin.
+
+This half is best-effort. By the time it runs the database is live and correct, so a slot that
+cannot be recreated is logged as an error and the restore still succeeds.
+
+Two things to know:
+
+- The restore role needs the `REPLICATION` attribute. It is not inherited through role membership,
+  so holding `cloudsqlsuperuser` or `alloydbsuperuser` is not enough — the restore-access
+  capabilities grant it directly. A restore warns before the swap if it is missing.
+- **A recreated slot starts at the current LSN.** Position is not transferable, and would be
+  meaningless anyway: the restore replaced every row. Downstream needs a backfill after each restore.
+
+`FOR ALL TABLES` and `FOR TABLES IN SCHEMA` store no table references and resolve membership at
+decode time, so they keep covering tables your migrations add. An enumerated `FOR TABLE a, b` list is
+frozen at the moment it was written; the restore carries it verbatim and warns about the tables it
+does not cover rather than extending it, because the list is a deliberate statement about what to
+replicate.
+
 ### Version compatibility
 
 The image and the modules version independently, so a snapshot and the restore that reads it are

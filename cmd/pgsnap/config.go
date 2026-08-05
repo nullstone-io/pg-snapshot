@@ -33,6 +33,7 @@ const (
 	ownerRoleEnvVar       = "OWNER_ROLE"
 	snapshotEnvVar        = "SNAPSHOT"
 	backupRetentionEnvVar = "BACKUP_RETENTION"
+	replicationEnvVar     = "RESTORE_REPLICATION"
 	migrateCommandEnvVar  = "MIGRATE_COMMAND"
 	logFormatEnvVar       = "LOG_FORMAT"
 	logLevelEnvVar        = "LOG_LEVEL"
@@ -47,6 +48,21 @@ func requireEnv(name string) (string, error) {
 		return "", fmt.Errorf("%s is required", name)
 	}
 	return value, nil
+}
+
+// boolEnv reads an on/off switch.
+//
+// Anything other than a recognised negative is the fallback: this gates behaviour that is on by
+// default, and a typo should not quietly disable it.
+func boolEnv(name string, fallback bool) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(name))) {
+	case "":
+		return fallback
+	case "0", "f", "false", "no", "off":
+		return false
+	default:
+		return true
+	}
 }
 
 func intEnv(name string, fallback int) (int, error) {

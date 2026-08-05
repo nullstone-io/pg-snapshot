@@ -1,12 +1,15 @@
 package acc
 
 import (
-	"fmt"
-
+	"bytes"
 	"context"
-	"github.com/jackc/pgx/v5"
+	"fmt"
+	"io"
+	"log/slog"
 	"testing"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/nullstone-io/pg-snapshot/pg"
 	"github.com/stretchr/testify/require"
 )
@@ -52,4 +55,56 @@ func withUser(url, user, password string) (string, error) {
 	}
 	return fmt.Sprintf("postgres://%s:%s@%s:%d/%s?sslmode=disable",
 		user, password, cfg.Host, cfg.Port, cfg.Database), nil
+}
+
+// discardLogger silences the log output of code under test.
+func discardLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+// captureLogger records what the code under test logged, for the assertions where the log *is* the
+// behaviour -- a warning nobody emits is the same as no warning at all.
+func captureLogger() (*slog.Logger, *bytes.Buffer) {
+	var buf bytes.Buffer
+	return slog.New(slog.NewTextHandler(&buf, nil)), &buf
+}
+
+// dbURL points the acceptance connection at another database on the same server.
+func dbURL(t *testing.T, database string) string {
+	t.Helper()
+
+	url, err := withDatabase(URL(), database)
+	require.NoError(t, err)
+	return url
+}
+
+// twoDatabases creates the pair a carryover acts across: the target being replaced and the staging
+// database that will take its place.
+func twoDatabases(t *testing.T, ctx context.Context, pool *pgxpool.Pool, prefix string) (target, staging string, cleanup func()) {
+	t.Helper()
+
+	target, staging = prefix+"_target", prefix+"_staging"
+	drop := func() {
+		for _, db := range []string{target, staging} {
+			pool.Exec(ctx, fmt.Sprintf(`DROP DATABASE IF EXISTS %s WITH (FORCE)`, db))
+		}
+	}
+	drop()
+
+	require.NoError(t, execAll(ctx, pool,
+		fmt.Sprintf(`CREATE DATABASE %s`, target),
+		fmt.Sprintf(`CREATE DATABASE %s`, staging),
+	))
+	return target, staging, drop
+}
+
+// execInDatabase runs statements against a database other than the suite's default.
+func execInDatabase(t *testing.T, ctx context.Context, url string, stmts ...string) {
+	t.Helper()
+
+	pool, err := pg.Open(ctx, url, 1)
+	require.NoError(t, err)
+	defer pool.Close()
+
+	require.NoError(t, execAll(ctx, pool, stmts...))
 }

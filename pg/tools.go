@@ -28,6 +28,10 @@ const (
 //     its own ownership with --role
 //   - --no-comments because COMMENT ON EXTENSION fails for non-superusers on both RDS and
 //     Cloud SQL, and it is the single most common restore error
+//   - --no-publications --no-subscriptions because replication topology belongs to the environment
+//     it runs in, not to the schema. A production publication feeding a data warehouse has no
+//     business being recreated in a lower environment, and ALTER PUBLICATION ... ADD TABLES IN
+//     SCHEMA needs superuser besides.
 //
 // snapshotID joins pg_dump to the export's own transaction snapshot, so the schema it captures is
 // the schema the data was copied under. Without it the two are read at different instants and a
@@ -39,12 +43,34 @@ func DumpSchema(ctx context.Context, url, outPath, snapshotID string) error {
 		"--no-owner",
 		"--no-acl",
 		"--no-comments",
+		"--no-publications",
+		"--no-subscriptions",
 		"--file=" + outPath,
 	}
 	if snapshotID != "" {
 		args = append(args, "--snapshot="+snapshotID)
 	}
 	return run(ctx, "pg_dump", append(args, url)...)
+}
+
+// DumpPublications writes an archive of a live database that *keeps* its publications.
+//
+// The inverse of DumpSchema's exclusion, and for the opposite reason: this reads the database the
+// restore is about to replace, so its replication topology is exactly what has to survive. Combined
+// with KeepOnly it yields the publications and nothing else.
+//
+// pg_dump is used rather than reading pg_publication directly because publications carry `publish`
+// parameters, publish_via_partition_root, per-table column lists and row filters, and pg_dump
+// already knows how to serialise all of it.
+func DumpPublications(ctx context.Context, url, outPath string) error {
+	return run(ctx, "pg_dump",
+		"--format=custom",
+		"--schema-only",
+		"--no-owner",
+		"--no-acl",
+		"--no-comments",
+		"--file="+outPath,
+		url)
 }
 
 // ListArchive reads an archive's table of contents, one entry per line.
@@ -59,50 +85,145 @@ func ListArchive(ctx context.Context, archivePath string) ([]string, error) {
 	return strings.Split(strings.ReplaceAll(out, "\r\n", "\n"), "\n"), nil
 }
 
+// Object descriptions this package can recognise in a table of contents.
+//
+// A description may contain spaces, so they are matched longest-first: "PUBLICATION TABLES IN
+// SCHEMA" has to win over "PUBLICATION" or the tail is misread.
+const (
+	DescExtension          = "EXTENSION"
+	DescPublication        = "PUBLICATION"
+	DescPublicationTable   = "PUBLICATION TABLE"
+	DescPublicationSchemas = "PUBLICATION TABLES IN SCHEMA"
+	DescSubscription       = "SUBSCRIPTION"
+)
+
+var knownDescs = []string{
+	DescPublicationSchemas,
+	DescPublicationTable,
+	DescPublication,
+	DescSubscription,
+	DescExtension,
+}
+
+// TocEntry is one line of a pg_restore --list table of contents.
+type TocEntry struct {
+	// Desc is the object type, e.g. "EXTENSION" or "PUBLICATION TABLES IN SCHEMA"
+	Desc string
+
+	// Schema is the object's schema, or "-" for objects that belong to none
+	Schema string
+
+	// Name is the object's tag
+	Name string
+}
+
+// ParseTocEntry reads a table-of-contents line.
+//
+// Entries are "<id>; <tableoid> <oid> <DESC> <schema> <name> [owner]". Only the descriptions in
+// knownDescs are recognised; everything else reports false and is left alone.
+func ParseTocEntry(line string) (TocEntry, bool) {
+	if !isEntryLine(line) {
+		return TocEntry{}, false
+	}
+	_, rest, ok := strings.Cut(line, ";")
+	if !ok {
+		return TocEntry{}, false
+	}
+	fields := strings.Fields(rest)
+	if len(fields) < 4 {
+		return TocEntry{}, false
+	}
+	fields = fields[2:] // drop tableoid and oid
+
+	for _, desc := range knownDescs {
+		words := strings.Fields(desc)
+		if len(fields) < len(words)+2 {
+			continue
+		}
+		if strings.Join(fields[:len(words)], " ") != desc {
+			continue
+		}
+		tail := fields[len(words):]
+		return TocEntry{Desc: desc, Schema: tail[0], Name: tail[1]}, true
+	}
+	return TocEntry{}, false
+}
+
 // ArchiveExtensions reports the extensions a table of contents would create.
 func ArchiveExtensions(toc []string) []string {
 	out := make([]string, 0)
 	for _, line := range toc {
-		if name, ok := extensionOf(line); ok {
-			out = append(out, name)
+		if e, ok := ParseTocEntry(line); ok && e.Desc == DescExtension {
+			out = append(out, e.Name)
 		}
 	}
 	return out
 }
 
-// CommentOutExtensions disables the entries that create the named extensions.
+// isEntryLine reports whether a line is a real table-of-contents entry rather than a comment, a
+// blank, or the archive header.
+//
+// The leading dump id has to parse as a number. Without that check a header line would be taken for
+// an entry the moment it happened to contain a semicolon.
+func isEntryLine(line string) bool {
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" || strings.HasPrefix(trimmed, ";") {
+		return false
+	}
+	id, rest, ok := strings.Cut(line, ";")
+	if !ok {
+		return false
+	}
+	if _, err := strconv.Atoi(strings.TrimSpace(id)); err != nil {
+		return false
+	}
+	return len(strings.Fields(rest)) >= 3
+}
+
+// IsPublication reports whether an entry is part of a publication definition.
+func IsPublication(e TocEntry) bool {
+	switch e.Desc {
+	case DescPublication, DescPublicationTable, DescPublicationSchemas:
+		return true
+	}
+	return false
+}
+
+// KeepOnly disables every entry keep does not select.
+//
+// The inverse of CommentOut, and not expressible through it: CommentOut leaves entries it cannot
+// parse alone, which is right when removing a known few and exactly wrong when isolating them.
+// Everything that is an entry and is not kept gets commented, recognised or not.
+func KeepOnly(toc []string, keep func(TocEntry) bool) []string {
+	out := make([]string, 0, len(toc))
+	for _, line := range toc {
+		if !isEntryLine(line) {
+			out = append(out, line)
+			continue
+		}
+		if e, ok := ParseTocEntry(line); ok && keep(e) {
+			out = append(out, line)
+			continue
+		}
+		out = append(out, ";"+line)
+	}
+	return out
+}
+
+// CommentOut disables the entries drop selects.
 //
 // Commenting rather than deleting because --use-list is an ordering as well as a selection: every
 // surviving entry keeps its position, so the only thing that changes is the statement being skipped.
-func CommentOutExtensions(toc []string, skip map[string]bool) []string {
+func CommentOut(toc []string, drop func(TocEntry) bool) []string {
 	out := make([]string, 0, len(toc))
 	for _, line := range toc {
-		if name, ok := extensionOf(line); ok && skip[name] {
+		if e, ok := ParseTocEntry(line); ok && drop(e) {
 			out = append(out, ";"+line)
 			continue
 		}
 		out = append(out, line)
 	}
 	return out
-}
-
-// extensionOf reads the extension name out of a table-of-contents entry.
-//
-// Entries are "<id>; <tableoid> <oid> <DESC> <schema> <name> [owner]". An extension belongs to no
-// schema, so its schema field is a literal "-" and the name follows it.
-func extensionOf(line string) (string, bool) {
-	if strings.HasPrefix(strings.TrimSpace(line), ";") {
-		return "", false
-	}
-	_, rest, ok := strings.Cut(line, ";")
-	if !ok {
-		return "", false
-	}
-	fields := strings.Fields(rest)
-	if len(fields) < 5 || fields[2] != "EXTENSION" {
-		return "", false
-	}
-	return fields[4], true
 }
 
 type RestoreOptions struct {

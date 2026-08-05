@@ -8,6 +8,7 @@ package pg
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/jackc/pgx/v5"
@@ -23,6 +24,12 @@ type Querier interface {
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
 	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+}
+
+// IsNoRows reports whether a query returned nothing, which for a lookup is an answer rather than a
+// failure.
+func IsNoRows(err error) bool {
+	return errors.Is(err, pgx.ErrNoRows)
 }
 
 // Open returns a pool sized for the requested concurrency.

@@ -66,7 +66,9 @@ func TestUseListSkipsExtensionsWithoutDroppingTheSection(t *testing.T) {
 		"the dump must carry the extension, or the test proves nothing")
 
 	listPath := archive + ".list"
-	filtered := pg.CommentOutExtensions(toc, map[string]bool{"pgcrypto": true})
+	filtered := pg.CommentOut(toc, func(e pg.TocEntry) bool {
+		return e.Desc == pg.DescExtension && e.Name == "pgcrypto"
+	})
 	require.NoError(t, os.WriteFile(listPath, []byte(strings.Join(filtered, "\n")), 0o600))
 
 	require.NoError(t, pg.RestoreSection(ctx, targetURL, archive, pg.RestoreOptions{

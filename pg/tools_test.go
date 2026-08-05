@@ -27,14 +27,16 @@ func TestExtensionEntries(t *testing.T) {
 	assert.Equal(t, []string{"pgcrypto", "google_vacuum_mgmt"}, ArchiveExtensions(toc))
 }
 
-func TestCommentOutExtensions(t *testing.T) {
+func TestCommentOut(t *testing.T) {
 	toc := []string{
 		"2; 3079 16385 EXTENSION - pgcrypto ",
 		"3; 3079 16512 EXTENSION - google_vacuum_mgmt ",
 		"210; 1259 16640 TABLE public users postgres",
 	}
 
-	got := CommentOutExtensions(toc, map[string]bool{"google_vacuum_mgmt": true})
+	got := CommentOut(toc, func(e TocEntry) bool {
+		return e.Desc == DescExtension && e.Name == "google_vacuum_mgmt"
+	})
 
 	assert.Equal(t, []string{
 		"2; 3079 16385 EXTENSION - pgcrypto ",
@@ -48,9 +50,41 @@ func TestCommentOutExtensions(t *testing.T) {
 
 // A commented entry must not be read back as a live one, or filtering an already-filtered list
 // would resurrect it.
-func TestCommentedEntriesAreNotExtensions(t *testing.T) {
+func TestCommentedEntriesAreNotParsed(t *testing.T) {
 	toc := []string{";3; 3079 16512 EXTENSION - google_vacuum_mgmt "}
 
 	assert.Empty(t, ArchiveExtensions(toc))
-	assert.Equal(t, toc, CommentOutExtensions(toc, map[string]bool{"google_vacuum_mgmt": true}))
+	assert.Equal(t, toc, CommentOut(toc, func(TocEntry) bool { return true }))
+}
+
+// A description containing spaces must not be mistaken for a shorter one that prefixes it, or the
+// schema and name are read out of the wrong fields.
+func TestParseTocEntryMultiWordDescriptions(t *testing.T) {
+	for _, tc := range []struct {
+		line string
+		want TocEntry
+	}{
+		{
+			"3460; 6106 16789 PUBLICATION - fortuna_ds_pub postgres",
+			TocEntry{Desc: DescPublication, Schema: "-", Name: "fortuna_ds_pub"},
+		},
+		{
+			"3461; 6108 16790 PUBLICATION TABLES IN SCHEMA - public postgres",
+			TocEntry{Desc: DescPublicationSchemas, Schema: "-", Name: "public"},
+		},
+		{
+			"3462; 6107 16791 PUBLICATION TABLE public users postgres",
+			TocEntry{Desc: DescPublicationTable, Schema: "public", Name: "users"},
+		},
+	} {
+		got, ok := ParseTocEntry(tc.line)
+		assert.True(t, ok, tc.line)
+		assert.Equal(t, tc.want, got, tc.line)
+	}
+}
+
+// An ordinary table must not be swept up by a filter aimed at replication objects
+func TestParseTocEntryIgnoresUnknownDescriptions(t *testing.T) {
+	_, ok := ParseTocEntry("210; 1259 16640 TABLE public users postgres")
+	assert.False(t, ok)
 }

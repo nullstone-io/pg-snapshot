@@ -42,6 +42,10 @@ type Options struct {
 
 	MigrateCommand string
 
+	// Replication carries the target's publications and replication slots onto the restored
+	// database. Off leaves the restored environment with neither.
+	Replication bool
+
 	Log *slog.Logger
 }
 
@@ -151,8 +155,8 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 	defer cleanup()
 
 	// Asked of the admin connection rather than the staging one: extension availability is a
-	// property of the instance, and the same list governs both sections.
-	listPath, err := PlanExtensions(ctx, adminPool, schemaPath, log)
+	// property of the instance. The same list governs both sections.
+	listPath, err := PlanSchemaFilter(ctx, adminPool, schemaPath, log)
 	if err != nil {
 		return nil, err
 	}
@@ -210,6 +214,44 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 		return nil, err
 	}
 
+	// Replication is carried in two halves, split by what the swap can and cannot reach.
+	//
+	// Publications are per-database, so they are copied onto staging now: the copy still in the
+	// target is not a name conflict, and a failure here aborts with the target untouched. Slots are
+	// cluster-wide and bound to a database OID, so they cannot be touched until the swap has closed
+	// the old database and made the orphan provably inactive.
+	targetURL, err := pg.WithDatabase(opts.AdminURL, opts.Target)
+	if err != nil {
+		return nil, err
+	}
+
+	var slots []Slot
+	slotter := Slots{Admin: adminPool, Log: log}
+	if opts.Replication {
+		publications := Publications{Dir: filepath.Dir(schemaPath), Log: log}
+		if err := publications.Carry(ctx, targetURL, stagingURL); err != nil {
+			return nil, err
+		}
+		if err := publications.ReportDrift(ctx, stagingPool); err != nil {
+			return nil, err
+		}
+
+		if slots, err = slotter.Capture(ctx, opts.Target); err != nil {
+			return nil, err
+		}
+		// Asked before the swap, while a missing grant is still cheap to act on
+		if len(slots) > 0 {
+			if ok, err := slotter.CanCreate(ctx); err != nil {
+				return nil, err
+			} else if !ok {
+				log.Warn("replication slots cannot be recreated after the swap",
+					"slots", names(slots),
+					"reason", "the restore role lacks the REPLICATION attribute, which is not "+
+						"inherited through role membership")
+			}
+		}
+	}
+
 	// Statistics are not carried by the snapshot, and a database with none plans every query
 	// badly. Cheaper here than after the swap, where it would compete with live traffic.
 	log.Info("analyzing", "database", staging)
@@ -225,6 +267,14 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 		return nil, err
 	}
 	success = true
+
+	// After the swap, so the orphaned slots are unreachable and droppable. targetURL rather than
+	// stagingURL: the staging database is the target now, and a slot is created in whichever
+	// database the session is connected to.
+	//
+	// Failures here are reported and not returned. The database is live and correct, and a slot
+	// that could not be recreated is a broken pipeline rather than a broken restore.
+	slotter.Rebind(ctx, targetURL, slots)
 
 	log.Info("restore complete",
 		"target", opts.Target, "snapshot", snapshot, "backup", backup, "rows", manifest.TotalRows())

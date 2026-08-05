@@ -8,6 +8,9 @@ services:
     # a pre-17 server rejects that parameter, so pg_restore 18 cannot load into a 16 target at all.
     # Restore this to 16 once MinServerMajor (export/catalog.go) and the image's client tools agree.
     image: postgres:18
+    # Logical decoding is off by default, and without it a replication slot cannot be created at
+    # all -- so the publication and slot carryover tests have nothing to assert against.
+    command: ["postgres", "-c", "wal_level=logical"]
     environment:
       POSTGRES_PASSWORD: postgres
     ports:
