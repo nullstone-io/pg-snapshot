@@ -47,8 +47,70 @@ func DumpSchema(ctx context.Context, url, outPath, snapshotID string) error {
 	return run(ctx, "pg_dump", append(args, url)...)
 }
 
+// ListArchive reads an archive's table of contents, one entry per line.
+//
+// The entries are the same text pg_restore --use-list consumes, so a caller can comment lines out
+// and hand the result straight back.
+func ListArchive(ctx context.Context, archivePath string) ([]string, error) {
+	out, err := output(ctx, "pg_restore", "--list", archivePath)
+	if err != nil {
+		return nil, err
+	}
+	return strings.Split(strings.ReplaceAll(out, "\r\n", "\n"), "\n"), nil
+}
+
+// ArchiveExtensions reports the extensions a table of contents would create.
+func ArchiveExtensions(toc []string) []string {
+	out := make([]string, 0)
+	for _, line := range toc {
+		if name, ok := extensionOf(line); ok {
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
+// CommentOutExtensions disables the entries that create the named extensions.
+//
+// Commenting rather than deleting because --use-list is an ordering as well as a selection: every
+// surviving entry keeps its position, so the only thing that changes is the statement being skipped.
+func CommentOutExtensions(toc []string, skip map[string]bool) []string {
+	out := make([]string, 0, len(toc))
+	for _, line := range toc {
+		if name, ok := extensionOf(line); ok && skip[name] {
+			out = append(out, ";"+line)
+			continue
+		}
+		out = append(out, line)
+	}
+	return out
+}
+
+// extensionOf reads the extension name out of a table-of-contents entry.
+//
+// Entries are "<id>; <tableoid> <oid> <DESC> <schema> <name> [owner]". An extension belongs to no
+// schema, so its schema field is a literal "-" and the name follows it.
+func extensionOf(line string) (string, bool) {
+	if strings.HasPrefix(strings.TrimSpace(line), ";") {
+		return "", false
+	}
+	_, rest, ok := strings.Cut(line, ";")
+	if !ok {
+		return "", false
+	}
+	fields := strings.Fields(rest)
+	if len(fields) < 5 || fields[2] != "EXTENSION" {
+		return "", false
+	}
+	return fields[4], true
+}
+
 type RestoreOptions struct {
 	Section Section
+
+	// ListPath is a --use-list file selecting which archive entries to replay. Empty replays
+	// every entry in the section.
+	ListPath string
 
 	// Jobs is only meaningful for post-data, where concurrent index builds and foreign key
 	// validation scans are the bulk of the work. pre-data is a single dependency chain.
@@ -69,6 +131,9 @@ func RestoreSection(ctx context.Context, url, archivePath string, opts RestoreOp
 	}
 	if opts.Role != "" {
 		args = append(args, "--role="+opts.Role)
+	}
+	if opts.ListPath != "" {
+		args = append(args, "--use-list="+opts.ListPath)
 	}
 	// Parallel restore needs the archive on local disk, which is why the schema archive is
 	// downloaded rather than streamed
@@ -119,16 +184,23 @@ func ToolVersion(ctx context.Context, tool string) (int, error) {
 //
 // Without this the caller gets "exit status 1" and none of the reason.
 func run(ctx context.Context, name string, args ...string) error {
-	var stderr bytes.Buffer
+	_, err := output(ctx, name, args...)
+	return err
+}
+
+// output executes a postgres client binary and returns its stdout.
+func output(ctx context.Context, name string, args ...string) (string, error) {
+	var stdout, stderr bytes.Buffer
 	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
 		detail := strings.TrimSpace(stderr.String())
 		if detail == "" {
-			return fmt.Errorf("%s failed: %w", name, err)
+			return "", fmt.Errorf("%s failed: %w", name, err)
 		}
-		return fmt.Errorf("%s failed: %w\n%s", name, err, detail)
+		return "", fmt.Errorf("%s failed: %w\n%s", name, err, detail)
 	}
-	return nil
+	return stdout.String(), nil
 }

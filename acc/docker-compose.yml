@@ -1,8 +1,13 @@
 services:
   db:
-    # 16 is the floor this tool supports; testing on the floor is what catches an accidental
-    # dependency on something newer
-    image: postgres:16
+    # Matches the client tools in the shipped image (postgres:18-alpine), which is the pairing
+    # that actually runs.
+    #
+    # This was postgres:16 to test on the documented floor, which is what caught the reason it
+    # cannot stay there: pg_dump 17+ writes `SET transaction_timeout = 0` into every archive, and
+    # a pre-17 server rejects that parameter, so pg_restore 18 cannot load into a 16 target at all.
+    # Restore this to 16 once MinServerMajor (export/catalog.go) and the image's client tools agree.
+    image: postgres:18
     environment:
       POSTGRES_PASSWORD: postgres
     ports:

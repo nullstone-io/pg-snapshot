@@ -74,8 +74,9 @@ Each module is a capability that grants appropriate permissions to allow the res
 - [gcp-postgres-restore-access](https://github.com/nullstone-modules/gcp-postgres-restore-access)
 
 The capability covers Postgres and only Postgres: it mints the restore role through `pg-db-admin`
-and publishes `POSTGRES_URL`, `TARGET_DATABASE`, `OWNER_ROLE` and `BACKUP_RETENTION`. Bucket access
-comes from `aws-s3-access` / `gcp-gcs-access`, and everything else is app configuration.
+and publishes `POSTGRES_URL`, `RESTORE_TARGET_DATABASE`, `RESTORE_OWNER_ROLE` and
+`RESTORE_BACKUP_RETENTION`. Bucket access comes from `aws-s3-access` / `gcp-gcs-access`, and
+everything else is app configuration.
 
 ```dockerfile
 FROM nullstone/pg-snapshot:v1.0.0
@@ -89,6 +90,96 @@ MIGRATE_COMMAND                       e.g. /app/migrate.sh
 ```
 
 Run it with `restore` — the image's entrypoint is already `pgsnap`.
+
+### Cross-account bucket access
+
+Snapshots live in a production bucket and the restore runs somewhere else, so the grant spans two
+accounts. `aws-s3-access` and `gcp-gcs-access` only write the half that lives in the restore's own
+account; the other half is on the bucket, in production, where Terraform running in a lower
+environment has no reach. `gcp-gcs-access` is explicit about it — it skips the IAM binding entirely
+when the app and the bucket are in different projects.
+
+Run the matching command below **once, against the bucket's account or project**.
+
+Grant reads and nothing else. The restore fetches objects, and lists prefixes to find the newest
+snapshot when `SNAPSHOT` is unset. It never writes to the bucket and never deletes from it —
+pruning old snapshots is the snapshot side's job, running in production where the bucket already is.
+
+#### AWS
+
+`put-bucket-policy` replaces the bucket's entire policy rather than adding to it, so start from
+whatever is already there:
+
+```bash
+aws s3api get-bucket-policy --bucket "$BUCKET" --query Policy --output text > bucket-policy.json
+```
+
+A `NoSuchBucketPolicy` error means there is no policy yet — start from
+`{"Version": "2012-10-17", "Statement": []}`.
+
+Add this statement, using the restore app's IAM role ARN:
+
+```json
+{
+  "Sid": "PgSnapshotRestoreRead",
+  "Effect": "Allow",
+  "Principal": { "AWS": "arn:aws:iam::<restore-account-id>:role/<restore-role-name>" },
+  "Action": ["s3:GetObject", "s3:ListBucket"],
+  "Resource": [
+    "arn:aws:s3:::<bucket>",
+    "arn:aws:s3:::<bucket>/*"
+  ]
+}
+```
+
+Both resources are required and they are not interchangeable: `s3:ListBucket` is authorized against
+the bucket ARN, `s3:GetObject` against the objects inside it. Granting only the `/*` form produces
+an `AccessDenied` on listing that reads as though the snapshot does not exist.
+
+```bash
+aws s3api put-bucket-policy --bucket "$BUCKET" --policy file://bucket-policy.json
+```
+
+If the bucket is encrypted with SSE-KMS under a customer-managed key, the key policy needs the same
+principal — a bucket policy alone leaves you with `AccessDenied` on `GetObject` and nothing to
+suggest why:
+
+```bash
+aws kms get-key-policy --key-id "$KEY_ID" --policy-name default \
+  --query Policy --output text > key-policy.json
+```
+
+```json
+{
+  "Sid": "PgSnapshotRestoreDecrypt",
+  "Effect": "Allow",
+  "Principal": { "AWS": "arn:aws:iam::<restore-account-id>:role/<restore-role-name>" },
+  "Action": ["kms:Decrypt"],
+  "Resource": "*"
+}
+```
+
+```bash
+aws kms put-key-policy --key-id "$KEY_ID" --policy-name default --policy file://key-policy.json
+```
+
+#### GCP
+
+```bash
+gcloud storage buckets add-iam-policy-binding "gs://${BUCKET_NAME}" \
+  --member="serviceAccount:${RESTORE_SA_EMAIL}" \
+  --role="roles/storage.objectViewer" \
+  --project="${BUCKET_PROJECT}"
+```
+
+`RESTORE_SA_EMAIL` is `service_account_email` from the restore app's outputs. This one is additive
+rather than a read-modify-write, so it is safe to re-run.
+
+`objectViewer` rather than the `objectAdmin` that `gcp-gcs-access` grants same-project: it carries
+`storage.objects.get` and `storage.objects.list`, which is the whole of what a restore does.
+
+Customer-managed encryption needs no extra grant here, unlike on AWS. Cloud Storage decrypts with
+its own service agent, so the reader never touches the key.
 
 ### Version compatibility
 

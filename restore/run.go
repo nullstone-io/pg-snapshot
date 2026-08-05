@@ -150,10 +150,18 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 	}
 	defer cleanup()
 
+	// Asked of the admin connection rather than the staging one: extension availability is a
+	// property of the instance, and the same list governs both sections.
+	listPath, err := PlanExtensions(ctx, adminPool, schemaPath, log)
+	if err != nil {
+		return nil, err
+	}
+
 	log.Info("restoring schema", "section", pg.SectionPreData, "database", staging)
 	if err := pg.RestoreSection(ctx, stagingURL, schemaPath, pg.RestoreOptions{
-		Section: pg.SectionPreData,
-		Role:    opts.Owner,
+		Section:  pg.SectionPreData,
+		Role:     opts.Owner,
+		ListPath: listPath,
 	}); err != nil {
 		return nil, err
 	}
@@ -181,9 +189,10 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 	// Foreign keys, indexes and triggers all land here, after every row is already in place
 	log.Info("restoring constraints and indexes", "section", pg.SectionPostData, "jobs", opts.Workers)
 	if err := pg.RestoreSection(ctx, stagingURL, schemaPath, pg.RestoreOptions{
-		Section: pg.SectionPostData,
-		Jobs:    opts.Workers,
-		Role:    opts.Owner,
+		Section:  pg.SectionPostData,
+		Jobs:     opts.Workers,
+		Role:     opts.Owner,
+		ListPath: listPath,
 	}); err != nil {
 		return nil, err
 	}
