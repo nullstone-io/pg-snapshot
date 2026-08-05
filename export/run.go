@@ -78,13 +78,17 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 		Config:       opts.Config,
 		Salt:         salt,
 	}
+	// preflight, upload schema, read sequences, copy tables -- a snapshot skips nothing
+	phases := &pg.Phases{Log: log, Total: 4}
+	done := phases.Start("preflight", "database", database)
+
 	report, err := preflight.Run(ctx)
 
 	// Logged before the error is returned, and on every outcome: what a failed snapshot connected
 	// to is the first question asked of it, and an error that reports only what it could not find
 	// leaves the operator guessing at where it looked.
 	if report != nil {
-		log.Info("preflight complete",
+		log.Info("preflight findings",
 			"database", report.Database,
 			"schemas", report.Schemas(),
 			"tables", len(report.Plan),
@@ -94,11 +98,14 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 	}
 
 	if err != nil {
+		done(err)
 		return nil, err
 	}
 	if err := report.Err(); err != nil {
+		done(err)
 		return nil, err
 	}
+	done(nil)
 	serverMajor := report.ServerMajor()
 
 	// The master connection holds the exported snapshot open. Every worker and pg_dump joins it,
@@ -132,18 +139,29 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 
 	layout := blobstore.NewLayout(database, time.Now())
 
-	if err := uploadSchema(ctx, opts, layout, snapshotID, log); err != nil {
+	if err := phases.Run(ctx, "upload schema", func() error {
+		return uploadSchema(ctx, opts, layout, snapshotID, log)
+	}, "path", layout.SchemaDump()); err != nil {
 		return nil, err
 	}
 
-	sequences, err := Introspector{DB: tx}.Sequences(ctx)
-	if err != nil {
+	var sequences []Sequence
+	if err := phases.Run(ctx, "read sequences", func() error {
+		sequences, err = Introspector{DB: tx}.Sequences(ctx)
+		if err != nil {
+			return err
+		}
+		logSequenceSources(log, sequences)
+		return nil
+	}); err != nil {
 		return nil, err
 	}
-	logSequenceSources(log, sequences)
 
-	entries, err := copyTables(ctx, pool, opts, layout, snapshotID, report.Plan, log)
-	if err != nil {
+	var entries []TableEntry
+	if err := phases.Run(ctx, "copy tables", func() error {
+		entries, err = copyTables(ctx, pool, opts, layout, snapshotID, report.Plan, log)
+		return err
+	}, "tables", len(report.Plan), "workers", opts.Workers); err != nil {
 		return nil, err
 	}
 

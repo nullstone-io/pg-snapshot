@@ -24,6 +24,16 @@ import (
 // version is set at build time via -ldflags
 var version = "dev"
 
+const banner = `
+                                    _
+   _ __   __ _ ___ _ __   __ _ _ __| |
+  | '_ \ / _` + "`" + ` / __| '_ \ / _` + "`" + ` | '_ \ |
+  | |_) | (_| \__ \ | | | (_| | |_) |_|
+  | .__/ \__, |___/_| |_|\__,_| .__/(_)
+  |_|    |___/                |_|      %s / %s
+
+`
+
 const usage = `pgsnap %s
 
   pgsnap snapshot   export a scrubbed snapshot of a production database to a bucket
@@ -65,6 +75,12 @@ func main() {
 	}
 
 	log := newLogger()
+
+	// To stderr rather than through the logger: it is decoration, and a json log stream being
+	// consumed by a collector should not have ascii art parsed into it.
+	if command := os.Args[1]; command == "snapshot" || command == "restore" || command == "repair" {
+		fmt.Fprintf(os.Stderr, banner, version, command)
+	}
 
 	// A snapshot or restore is long-running and interruptible. Cancelling on a signal lets the
 	// deferred cleanup drop a half-loaded staging database rather than leaving it for the next
@@ -125,6 +141,15 @@ func runSnapshot(ctx context.Context, log *slog.Logger) error {
 		return err
 	}
 
+	// The scrub rules are named rather than dumped: the config can be large, and which tables have
+	// a rule is the part worth seeing before an export that cannot be taken back.
+	log.Info("snapshot starting",
+		"version", version,
+		"bucket", store.String(),
+		"workers", workers,
+		"scrubbedTables", cfg.TableNames(),
+		"fkMode", orDefault(string(cfg.FKMode), "validate"))
+
 	result, err := export.Run(ctx, export.Options{
 		ConnURL:     url,
 		Store:       store,
@@ -172,16 +197,34 @@ func runRestore(ctx context.Context, log *slog.Logger) error {
 		return err
 	}
 
+	snapshot := os.Getenv(snapshotEnvVar)
+	migrate := os.Getenv(migrateCommandEnvVar)
+	replication := boolEnv(replicationEnvVar, true)
+
+	// Logged before anything runs, and without the connection url, which carries a password.
+	// A restore takes about an hour; being able to tell from the first line that it is pointed at
+	// the wrong database is worth more than the line costs.
+	log.Info("restore starting",
+		"version", version,
+		"target", target,
+		"owner", owner,
+		"bucket", store.String(),
+		"snapshot", orDefault(snapshot, "newest"),
+		"workers", workers,
+		"backupRetention", retention,
+		"migrateCommand", orDefault(migrate, "(none)"),
+		"replication", replication)
+
 	result, err := restore.Run(ctx, restore.Options{
 		AdminURL:        url,
 		Target:          target,
 		Owner:           owner,
 		Store:           store,
-		Snapshot:        os.Getenv(snapshotEnvVar),
+		Snapshot:        snapshot,
 		Workers:         workers,
 		BackupRetention: retention,
-		MigrateCommand:  os.Getenv(migrateCommandEnvVar),
-		Replication:     boolEnv(replicationEnvVar, true),
+		MigrateCommand:  migrate,
+		Replication:     replication,
 		Log:             log,
 	})
 	if err != nil {

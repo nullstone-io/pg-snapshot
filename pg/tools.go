@@ -53,26 +53,6 @@ func DumpSchema(ctx context.Context, url, outPath, snapshotID string) error {
 	return run(ctx, "pg_dump", append(args, url)...)
 }
 
-// DumpPublications writes an archive of a live database that *keeps* its publications.
-//
-// The inverse of DumpSchema's exclusion, and for the opposite reason: this reads the database the
-// restore is about to replace, so its replication topology is exactly what has to survive. Combined
-// with KeepOnly it yields the publications and nothing else.
-//
-// pg_dump is used rather than reading pg_publication directly because publications carry `publish`
-// parameters, publish_via_partition_root, per-table column lists and row filters, and pg_dump
-// already knows how to serialise all of it.
-func DumpPublications(ctx context.Context, url, outPath string) error {
-	return run(ctx, "pg_dump",
-		"--format=custom",
-		"--schema-only",
-		"--no-owner",
-		"--no-acl",
-		"--no-comments",
-		"--file="+outPath,
-		url)
-}
-
 // ListArchive reads an archive's table of contents, one entry per line.
 //
 // The entries are the same text pg_restore --use-list consumes, so a caller can comment lines out
@@ -187,27 +167,6 @@ func IsPublication(e TocEntry) bool {
 		return true
 	}
 	return false
-}
-
-// KeepOnly disables every entry keep does not select.
-//
-// The inverse of CommentOut, and not expressible through it: CommentOut leaves entries it cannot
-// parse alone, which is right when removing a known few and exactly wrong when isolating them.
-// Everything that is an entry and is not kept gets commented, recognised or not.
-func KeepOnly(toc []string, keep func(TocEntry) bool) []string {
-	out := make([]string, 0, len(toc))
-	for _, line := range toc {
-		if !isEntryLine(line) {
-			out = append(out, line)
-			continue
-		}
-		if e, ok := ParseTocEntry(line); ok && keep(e) {
-			out = append(out, line)
-			continue
-		}
-		out = append(out, ";"+line)
-	}
-	return out
 }
 
 // CommentOut disables the entries drop selects.

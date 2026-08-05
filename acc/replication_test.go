@@ -39,8 +39,8 @@ func TestCarryPublicationSchemaIndependentForms(t *testing.T) {
 				`CREATE TABLE original(id int PRIMARY KEY)`,
 				`CREATE TABLE added_by_migration(id int PRIMARY KEY)`)
 
-			require.NoError(t, (restore.Publications{Dir: t.TempDir(), Log: discardLogger()}).
-				Carry(ctx, targetURL, stagingURL))
+			require.NoError(t, (restore.Publications{Log: discardLogger()}).
+				Carry(ctx, poolFor(t, ctx, targetURL), poolFor(t, ctx, stagingURL)))
 
 			stagingPool, err := pg.Open(ctx, stagingURL, 1)
 			require.NoError(t, err)
@@ -83,8 +83,8 @@ func TestCarryPublicationEnumeratedForm(t *testing.T) {
 		`CREATE TABLE added_by_migration(id int PRIMARY KEY)`)
 
 	log, logged := captureLogger()
-	publications := restore.Publications{Dir: t.TempDir(), Log: log}
-	require.NoError(t, publications.Carry(ctx, targetURL, stagingURL))
+	publications := restore.Publications{Log: log}
+	require.NoError(t, publications.Carry(ctx, poolFor(t, ctx, targetURL), poolFor(t, ctx, stagingURL)))
 
 	stagingPool, err := pg.Open(ctx, stagingURL, 1)
 	require.NoError(t, err)
@@ -135,8 +135,8 @@ func TestReportDriftSilentForSchemaIndependentForms(t *testing.T) {
 		`CREATE TABLE added_by_migration(id int PRIMARY KEY)`)
 
 	log, logged := captureLogger()
-	publications := restore.Publications{Dir: t.TempDir(), Log: log}
-	require.NoError(t, publications.Carry(ctx, targetURL, stagingURL))
+	publications := restore.Publications{Log: log}
+	require.NoError(t, publications.Carry(ctx, poolFor(t, ctx, targetURL), poolFor(t, ctx, stagingURL)))
 
 	stagingPool, err := pg.Open(ctx, stagingURL, 1)
 	require.NoError(t, err)
@@ -161,8 +161,8 @@ func TestCarryPublicationFailsOnMissingTable(t *testing.T) {
 
 	execInDatabase(t, ctx, stagingURL, `CREATE TABLE kept(id int PRIMARY KEY)`)
 
-	err := (restore.Publications{Dir: t.TempDir(), Log: discardLogger()}).
-		Carry(ctx, targetURL, stagingURL)
+	err := (restore.Publications{Log: discardLogger()}).
+		Carry(ctx, poolFor(t, ctx, targetURL), poolFor(t, ctx, stagingURL))
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "carried")

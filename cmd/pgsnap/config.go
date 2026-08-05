@@ -50,6 +50,15 @@ func requireEnv(name string) (string, error) {
 	return value, nil
 }
 
+// orDefault renders an unset value as something an operator can read, so a log line says
+// "(none)" rather than trailing off into an empty field.
+func orDefault(value, fallback string) string {
+	if strings.TrimSpace(value) == "" {
+		return fallback
+	}
+	return value
+}
+
 // boolEnv reads an on/off switch.
 //
 // Anything other than a recognised negative is the fallback: this gates behaviour that is on by

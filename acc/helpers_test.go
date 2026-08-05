@@ -69,6 +69,16 @@ func captureLogger() (*slog.Logger, *bytes.Buffer) {
 	return slog.New(slog.NewTextHandler(&buf, nil)), &buf
 }
 
+// poolFor opens a pool against another database on the same server, closed when the test ends.
+func poolFor(t *testing.T, ctx context.Context, url string) *pgxpool.Pool {
+	t.Helper()
+
+	pool, err := pg.Open(ctx, url, 1)
+	require.NoError(t, err)
+	t.Cleanup(pool.Close)
+	return pool
+}
+
 // dbURL points the acceptance connection at another database on the same server.
 func dbURL(t *testing.T, database string) string {
 	t.Helper()

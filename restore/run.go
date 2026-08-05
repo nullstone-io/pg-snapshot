@@ -95,30 +95,51 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 	}
 	defer admin.Unlock(context.WithoutCancel(ctx), opts.Target)
 
+	// Eight phases always run: recover, select snapshot, restore schema, load data, restore
+	// constraints, carry privileges, analyze, swap. The rest depend on configuration, which is why
+	// the total is worked out here rather than declared as a list -- and why the phase logger drops
+	// the denominator rather than printing "9 of 8" if this arithmetic is ever wrong.
+	total := 8
+	if opts.MigrateCommand != "" {
+		total++
+	}
+	if opts.Replication {
+		total += 2 // carry publications, rebind slots
+	}
+	phases := &pg.Phases{Log: log, Total: total}
+
 	// Whatever a previous run left behind is resolved before anything new is created
-	if err := admin.Recover(ctx, opts.Target); err != nil {
-		return nil, err
-	}
-
-	set, err := admin.Inspect(ctx, opts.Target)
-	if err != nil {
-		return nil, err
-	}
-	if state := Classify(set); state != StateIdle {
-		return nil, fmt.Errorf("target %q is not in a state a restore can start from: %s (%s)",
-			opts.Target, state, set.Describe())
-	}
-
-	// Dropped now rather than at the end of the previous run: a backup is only safe to discard
-	// once there is a newer database to fall back to
-	for _, name := range set.ExpiredBackups(opts.BackupRetention) {
-		if err := admin.DropDatabase(ctx, name); err != nil {
-			return nil, err
+	var set DatabaseSet
+	if err := phases.Run(ctx, "recover", func() error {
+		if err := admin.Recover(ctx, opts.Target); err != nil {
+			return err
 		}
+		set, err = admin.Inspect(ctx, opts.Target)
+		if err != nil {
+			return err
+		}
+		if state := Classify(set); state != StateIdle {
+			return fmt.Errorf("target %q is not in a state a restore can start from: %s (%s)",
+				opts.Target, state, set.Describe())
+		}
+		// Dropped now rather than at the end of the previous run: a backup is only safe to
+		// discard once there is a newer database to fall back to
+		for _, name := range set.ExpiredBackups(opts.BackupRetention) {
+			if err := admin.DropDatabase(ctx, name); err != nil {
+				return err
+			}
+		}
+		return nil
+	}, "target", opts.Target); err != nil {
+		return nil, err
 	}
 
-	manifest, snapshot, err := resolveSnapshot(ctx, opts, adminPool, log)
-	if err != nil {
+	var manifest *export.Manifest
+	var snapshot string
+	if err := phases.Run(ctx, "select snapshot", func() error {
+		manifest, snapshot, err = resolveSnapshot(ctx, opts, adminPool, log)
+		return err
+	}); err != nil {
 		return nil, err
 	}
 	layout := blobstore.Layout{Database: manifest.Source.Database, Timestamp: snapshot}
@@ -161,12 +182,13 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 		return nil, err
 	}
 
-	log.Info("restoring schema", "section", pg.SectionPreData, "database", staging)
-	if err := pg.RestoreSection(ctx, stagingURL, schemaPath, pg.RestoreOptions{
-		Section:  pg.SectionPreData,
-		Role:     opts.Owner,
-		ListPath: listPath,
-	}); err != nil {
+	if err := phases.Run(ctx, "restore schema", func() error {
+		return pg.RestoreSection(ctx, stagingURL, schemaPath, pg.RestoreOptions{
+			Section:  pg.SectionPreData,
+			Role:     opts.Owner,
+			ListPath: listPath,
+		})
+	}, "section", pg.SectionPreData, "database", staging); err != nil {
 		return nil, err
 	}
 
@@ -176,41 +198,49 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 	}
 	defer stagingPool.Close()
 
-	loader := Loader{
-		Pool:    stagingPool,
-		Store:   opts.Store,
-		Layout:  layout,
-		Workers: opts.Workers,
-		Log:     log,
-	}
-	if err := loader.Load(ctx, manifest.Tables); err != nil {
-		return nil, err
-	}
-	if err := ApplySequences(ctx, stagingPool, manifest.Sequences, log); err != nil {
+	if err := phases.Run(ctx, "load data", func() error {
+		loader := Loader{
+			Pool:    stagingPool,
+			Store:   opts.Store,
+			Layout:  layout,
+			Workers: opts.Workers,
+			Log:     log,
+		}
+		if err := loader.Load(ctx, manifest.Tables); err != nil {
+			return err
+		}
+		return ApplySequences(ctx, stagingPool, manifest.Sequences, log)
+	}, "tables", len(manifest.Tables), "rows", manifest.TotalRows(), "workers", opts.Workers); err != nil {
 		return nil, err
 	}
 
 	// Foreign keys, indexes and triggers all land here, after every row is already in place
-	log.Info("restoring constraints and indexes", "section", pg.SectionPostData, "jobs", opts.Workers)
-	if err := pg.RestoreSection(ctx, stagingURL, schemaPath, pg.RestoreOptions{
-		Section:  pg.SectionPostData,
-		Jobs:     opts.Workers,
-		Role:     opts.Owner,
-		ListPath: listPath,
-	}); err != nil {
+	if err := phases.Run(ctx, "restore constraints and indexes", func() error {
+		return pg.RestoreSection(ctx, stagingURL, schemaPath, pg.RestoreOptions{
+			Section:  pg.SectionPostData,
+			Jobs:     opts.Workers,
+			Role:     opts.Owner,
+			ListPath: listPath,
+		})
+	}, "section", pg.SectionPostData, "jobs", opts.Workers); err != nil {
 		return nil, err
 	}
 
-	migrator := Migrator{
-		Command:     opts.MigrateCommand,
-		DatabaseURL: stagingURL,
-		Log:         log,
-	}
-	if err := migrator.Run(ctx); err != nil {
-		return nil, err
+	if opts.MigrateCommand != "" {
+		if err := phases.Run(ctx, "migrate", func() error {
+			return Migrator{
+				Command:     opts.MigrateCommand,
+				DatabaseURL: stagingURL,
+				Log:         log,
+			}.Run(ctx)
+		}, "command", opts.MigrateCommand); err != nil {
+			return nil, err
+		}
 	}
 
-	if err := (Carryover{DB: adminPool, Log: log}).Apply(ctx, opts.Target, staging); err != nil {
+	if err := phases.Run(ctx, "carry database privileges and settings", func() error {
+		return (Carryover{DB: adminPool, Log: log}).Apply(ctx, opts.Target, staging)
+	}, "from", opts.Target, "to", staging); err != nil {
 		return nil, err
 	}
 
@@ -228,42 +258,57 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 	var slots []Slot
 	slotter := Slots{Admin: adminPool, Log: log}
 	if opts.Replication {
-		publications := Publications{Dir: filepath.Dir(schemaPath), Log: log}
-		if err := publications.Carry(ctx, targetURL, stagingURL); err != nil {
-			return nil, err
-		}
-		if err := publications.ReportDrift(ctx, stagingPool); err != nil {
-			return nil, err
-		}
-
-		if slots, err = slotter.Capture(ctx, opts.Target); err != nil {
-			return nil, err
-		}
-		// Asked before the swap, while a missing grant is still cheap to act on
-		if len(slots) > 0 {
-			if ok, err := slotter.CanCreate(ctx); err != nil {
-				return nil, err
-			} else if !ok {
-				log.Warn("replication slots cannot be recreated after the swap",
-					"slots", names(slots),
-					"reason", "the restore role lacks the REPLICATION attribute, which is not "+
-						"inherited through role membership")
+		if err := phases.Run(ctx, "carry publications", func() error {
+			targetPool, err := pg.Open(ctx, targetURL, 1)
+			if err != nil {
+				return err
 			}
+			defer targetPool.Close()
+
+			publications := Publications{Log: log}
+			if err := publications.Carry(ctx, targetPool, stagingPool); err != nil {
+				return err
+			}
+			if err := publications.ReportDrift(ctx, stagingPool); err != nil {
+				return err
+			}
+
+			if slots, err = slotter.Capture(ctx, opts.Target); err != nil {
+				return err
+			}
+			// Asked before the swap, while a missing grant is still cheap to act on
+			if len(slots) > 0 {
+				if ok, err := slotter.CanCreate(ctx); err != nil {
+					return err
+				} else if !ok {
+					log.Warn("replication slots cannot be recreated after the swap",
+						"slots", names(slots),
+						"reason", "the restore role lacks the REPLICATION attribute, which is "+
+							"not inherited through role membership")
+				}
+			}
+			return nil
+		}, "from", opts.Target, "to", staging); err != nil {
+			return nil, err
 		}
 	}
 
 	// Statistics are not carried by the snapshot, and a database with none plans every query
 	// badly. Cheaper here than after the swap, where it would compete with live traffic.
-	log.Info("analyzing", "database", staging)
-	if err := pg.Analyze(ctx, stagingURL, opts.Workers); err != nil {
+	if err := phases.Run(ctx, "analyze", func() error {
+		return pg.Analyze(ctx, stagingURL, opts.Workers)
+	}, "database", staging, "jobs", opts.Workers); err != nil {
 		return nil, err
 	}
 
 	// The pool holds open sessions on the staging database, and an open session blocks its rename
 	stagingPool.Close()
 
-	backup, err := admin.Swap(ctx, opts.Target, staging)
-	if err != nil {
+	var backup string
+	if err := phases.Run(ctx, "swap", func() error {
+		backup, err = admin.Swap(ctx, opts.Target, staging)
+		return err
+	}, "target", opts.Target, "staging", staging); err != nil {
 		return nil, err
 	}
 	success = true
@@ -274,7 +319,14 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 	//
 	// Failures here are reported and not returned. The database is live and correct, and a slot
 	// that could not be recreated is a broken pipeline rather than a broken restore.
-	slotter.Rebind(ctx, targetURL, slots)
+	// Run whenever replication is on, even with no slots to rebind, so the phase count declared at
+	// the start is the count actually reported. Rebind returns immediately on an empty list.
+	if opts.Replication {
+		phases.Run(ctx, "rebind replication slots", func() error {
+			slotter.Rebind(ctx, targetURL, slots)
+			return nil
+		}, "slots", names(slots))
+	}
 
 	log.Info("restore complete",
 		"target", opts.Target, "snapshot", snapshot, "backup", backup, "rows", manifest.TotalRows())
