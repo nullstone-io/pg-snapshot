@@ -68,10 +68,38 @@ type TableEntry struct {
 	// embeds the run's salt, and this file ships to the bucket next to the data.
 	Transforms map[string]string `json:"transforms,omitempty"`
 
+	// Tail records the heap-tail sampling this entry's rows came from, when `tail_rows` was
+	// configured -- including a run where the window fell back to the whole table, which reads
+	// as PagesRead == TotalPages. Absent for a table exported in full without tail_rows.
+	Tail *TailReport `json:"tail,omitempty"`
+
 	RowCount int64  `json:"rowCount"`
 	File     string `json:"file,omitempty"`
 	Bytes    int64  `json:"bytes"`
 	SHA256   string `json:"sha256,omitempty"`
+}
+
+// TailReport is what a tail-sampled table leaves behind for an operator.
+//
+// RequestedRows against the entry's RowCount shows the deliberate overshoot; Min/Max of the
+// report column is how the tail-is-newest assumption is watched -- it degrades silently under
+// heavy UPDATE traffic or after a VACUUM FULL, and a reported window that stops looking recent
+// is the visible symptom. This field is additive, so the artifact version is unchanged: an older
+// restore ignores it, and the rows load the same either way.
+type TailReport struct {
+	// RequestedRows is the configured tail_rows
+	RequestedRows int64 `json:"requestedRows"`
+
+	// TotalPages and PagesRead describe the heap window: how big the table was, and how little
+	// of it the export read
+	TotalPages int64 `json:"totalPages"`
+	PagesRead  int64 `json:"pagesRead"`
+
+	// ReportColumn is the configured tail_report_column, with the exported window's range of it
+	// rendered as text. Empty when none was named, or when the window held no rows.
+	ReportColumn string `json:"reportColumn,omitempty"`
+	Min          string `json:"min,omitempty"`
+	Max          string `json:"max,omitempty"`
 }
 
 func (t TableEntry) Qualified() string {

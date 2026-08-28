@@ -39,6 +39,23 @@ type TableConfig struct {
 	// Where is a raw SQL predicate restricting the exported rows. See Config.FKMode.
 	Where string `yaml:"where"`
 
+	// TailRows exports approximately the newest n rows of the table, located by physical heap
+	// position rather than by any column -- the export reads only the last pages of the heap.
+	//
+	// This exists for the table `where` cannot afford: a large append-only table whose timestamp
+	// has no index, where a predicate would seq-scan everything and an ORDER BY would sort it.
+	// It assumes the heap's tail is the newest data, which holds for append-only tables and
+	// degrades under heavy UPDATE traffic or after a VACUUM FULL. See Config.FKMode: a tail
+	// window is a row filter and orphans child rows exactly as `where` does.
+	//
+	// A pointer so that an explicit `tail_rows: 0` is rejected rather than silently read as unset.
+	TailRows *int64 `yaml:"tail_rows"`
+
+	// TailReportColumn names a column whose min/max over the exported window is recorded in the
+	// manifest. The tail-is-newest assumption degrades silently; the reported time window is how
+	// an operator notices.
+	TailReportColumn string `yaml:"tail_report_column"`
+
 	// Columns maps a column name to either a builtin transform name or a raw SQL expression.
 	// A name is read as a builtin only when it matches one exactly; everything else is passed
 	// through to postgres untouched.
@@ -119,6 +136,22 @@ func (c Config) Validate() error {
 			if len(tc.Columns) > 0 {
 				errs = append(errs, fmt.Errorf("table %q: `columns` has no effect with mode: skip", name))
 			}
+			if tc.TailRows != nil {
+				errs = append(errs, fmt.Errorf("table %q: `tail_rows` has no effect with mode: skip", name))
+			}
+		}
+
+		if tc.TailRows != nil {
+			if *tc.TailRows < 1 {
+				errs = append(errs, fmt.Errorf("table %q: tail_rows must be at least 1, got %d", name, *tc.TailRows))
+			}
+			// The tail window is itself a row filter; combining it with `where` would demand an
+			// answer to which applies first, and both answers surprise somebody
+			if tc.Where != "" {
+				errs = append(errs, fmt.Errorf("table %q: `tail_rows` and `where` cannot be combined", name))
+			}
+		} else if tc.TailReportColumn != "" {
+			errs = append(errs, fmt.Errorf("table %q: `tail_report_column` has no effect without tail_rows", name))
 		}
 
 		for _, col := range sortedKeys(tc.Columns) {

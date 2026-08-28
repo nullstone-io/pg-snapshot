@@ -59,6 +59,44 @@ applies or is reported; silently not applying is the one outcome worse than no r
 Row filtering with `where` can orphan child rows and break foreign key creation on restore. Set
 `fk_mode: not_valid` when that is intentional.
 
+### Sampling large append-only tables with `tail_rows`
+
+```yaml
+tables:
+  public.activity_log:
+    tail_rows: 2000                  # ≈ the newest 2000 rows, by heap position
+    tail_report_column: created_at   # optional: record the window's time range in the manifest
+```
+
+`tail_rows: n` exports approximately the **newest** `n` rows of a table instead of all of them,
+located by physical heap position rather than by any column. It exists for the table `where`
+cannot afford: a large append-only table — an events log, say — with no index on its timestamp.
+There, `where: "created_at > …"` seq-scans the entire table inside the export's long-lived
+transaction, and `ORDER BY created_at DESC LIMIT n` adds a full sort that can exhaust the source's
+temp disk. The tail export instead measures the heap's size and the live-row density of its last
+pages, then copies only a computed window of trailing pages with a `ctid` range predicate —
+reading megabytes where the alternatives read the whole table.
+
+Three things to know:
+
+- **It assumes append-only.** "The end of the heap is the newest data" holds for insert-only
+  tables and degrades silently if the table starts taking heavy `UPDATE` traffic or is
+  `VACUUM FULL`'d — reclaimed space early in the heap absorbs new rows. Name a
+  `tail_report_column` and watch the reported window in the manifest: a range that stops looking
+  recent is the symptom.
+- **It overshoots on purpose.** The window is sized with a margin, so the export lands somewhat
+  *over* `n` (a few percent at small `n`, more at very large `n`) rather than ever under it. A
+  probe that finds no live rows in the tail falls back to exporting the whole table — loudly,
+  never to a silent empty export — and a run that still comes back short of `n` (possible when
+  the window is wider than the probed pages) is logged as a warning.
+- **It is a row filter, exactly like `where`.** Rows in other tables that reference excluded rows
+  become orphans, and FK creation on restore fails unless `fk_mode: not_valid` is set.
+
+`tail_rows` is mutually exclusive with `mode: skip` and with `where`, and composes normally with
+`columns` scrubbing. On partitioned tables, configure the leaf partitions (as with every rule);
+`n` then applies per partition. Each tail-sampled table records its window in the manifest:
+requested rows, pages read of total, actual exported row count, and the report column's min/max.
+
 ## Requirements
 
 - PostgreSQL **16 or newer**, source and target

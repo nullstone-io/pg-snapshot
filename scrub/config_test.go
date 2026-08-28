@@ -114,6 +114,64 @@ func TestConfigValidate(t *testing.T) {
 		assert.Contains(t, err.Error(), "`columns` has no effect with mode: skip")
 	})
 
+	t.Run("parses tail_rows", func(t *testing.T) {
+		cfg, err := Parse([]byte(`
+version: 1
+fk_mode: not_valid
+tables:
+  public.activity_log:
+    tail_rows: 2000
+    tail_report_column: created_at
+`))
+		require.NoError(t, err)
+
+		tc, ok := cfg.TableConfigFor("public", "activity_log")
+		require.True(t, ok)
+		require.NotNil(t, tc.TailRows)
+		assert.Equal(t, int64(2000), *tc.TailRows)
+		assert.Equal(t, "created_at", tc.TailReportColumn)
+	})
+
+	// An explicit zero is a rule that silently would not apply, which is the failure mode this
+	// package exists to prevent -- hence the pointer in TableConfig
+	t.Run("rejects tail_rows of zero", func(t *testing.T) {
+		err := Config{
+			Version: 1,
+			Tables:  map[string]TableConfig{"public.activity_log": {TailRows: ptr(int64(0))}},
+		}.Validate()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "tail_rows must be at least 1")
+	})
+
+	t.Run("rejects tail_rows with mode skip", func(t *testing.T) {
+		err := Config{
+			Version: 1,
+			Tables:  map[string]TableConfig{"public.activity_log": {Mode: TableModeSkip, TailRows: ptr(int64(10))}},
+		}.Validate()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "`tail_rows` has no effect with mode: skip")
+	})
+
+	t.Run("rejects tail_rows combined with where", func(t *testing.T) {
+		err := Config{
+			Version: 1,
+			Tables: map[string]TableConfig{
+				"public.activity_log": {Where: "id > 0", TailRows: ptr(int64(10))},
+			},
+		}.Validate()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "`tail_rows` and `where` cannot be combined")
+	})
+
+	t.Run("rejects tail_report_column without tail_rows", func(t *testing.T) {
+		err := Config{
+			Version: 1,
+			Tables:  map[string]TableConfig{"public.activity_log": {TailReportColumn: "created_at"}},
+		}.Validate()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "`tail_report_column` has no effect without tail_rows")
+	})
+
 	t.Run("rejects empty transform", func(t *testing.T) {
 		err := Config{
 			Version: 1,
@@ -123,6 +181,8 @@ func TestConfigValidate(t *testing.T) {
 		assert.Contains(t, err.Error(), "transform is empty")
 	})
 }
+
+func ptr[T any](v T) *T { return &v }
 
 func TestSplitQualified(t *testing.T) {
 	schema, table, err := SplitQualified("public.users")

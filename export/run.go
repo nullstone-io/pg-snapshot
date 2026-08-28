@@ -340,6 +340,40 @@ func copyOne(ctx context.Context, pool *pgxpool.Pool, store blobstore.Store, lay
 		return entry, fmt.Errorf("error disabling row security: %w", err)
 	}
 
+	// The tail window is planned on this same transaction, after it joined the export snapshot,
+	// so the probe counts exactly the rows the COPY will see and the window agrees with every
+	// other table in the run
+	copySQL := p.CopyOut()
+	if p.TailRows > 0 {
+		window, err := PlanTailWindow(ctx, tx, p)
+		if err != nil {
+			return entry, err
+		}
+		if window.Full() {
+			log.Warn("tail_rows window not applied; exporting the table in full",
+				"table", p.Table.Qualified(), "requestedRows", p.TailRows, "reason", window.Reason)
+		} else {
+			copySQL = p.CopyOutTail(window.StartPage)
+			log.Info("tail window planned", "table", p.Table.Qualified(),
+				"requestedRows", p.TailRows,
+				"pagesRead", window.PagesRead(), "totalPages", window.TotalPages)
+		}
+
+		entry.Tail = &TailReport{
+			RequestedRows: p.TailRows,
+			TotalPages:    window.TotalPages,
+			PagesRead:     window.PagesRead(),
+		}
+		if p.TailReportColumn != "" {
+			lo, hi, err := ReadTailRange(ctx, tx, p, window)
+			if err != nil {
+				return entry, err
+			}
+			entry.Tail.ReportColumn = p.TailReportColumn
+			entry.Tail.Min, entry.Tail.Max = lo, hi
+		}
+	}
+
 	pr, pw := io.Pipe()
 	hasher := sha256.New()
 	copied := make(chan int64, 1)
@@ -348,7 +382,7 @@ func copyOne(ctx context.Context, pool *pgxpool.Pool, store blobstore.Store, lay
 		defer close(copied)
 
 		gz := gzip.NewWriter(io.MultiWriter(pw, hasher))
-		tag, err := tx.Conn().PgConn().CopyTo(ctx, gz, p.CopyOut())
+		tag, err := tx.Conn().PgConn().CopyTo(ctx, gz, copySQL)
 		if err == nil {
 			copied <- tag.RowsAffected()
 			err = gz.Close()
@@ -368,6 +402,11 @@ func copyOne(ctx context.Context, pool *pgxpool.Pool, store blobstore.Store, lay
 	entry.File = key
 	entry.Bytes = n
 	entry.SHA256 = hex.EncodeToString(hasher.Sum(nil))
+
+	if msg, short := tailShortfall(entry); short {
+		log.Warn(msg, "table", p.Table.Qualified(),
+			"requestedRows", p.TailRows, "rows", entry.RowCount)
+	}
 
 	log.Info("table exported", "table", p.Table.Qualified(), "rows", entry.RowCount, "bytes", n)
 	return entry, nil

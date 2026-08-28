@@ -27,6 +27,16 @@ type Projection struct {
 	// written to the bucket alongside the data.
 	Transforms map[string]string
 
+	// TailRows is the requested heap-tail sample size; 0 exports the table in full.
+	//
+	// The projection only carries the request: the window itself depends on the table's live
+	// heap, so the export sizes it at copy time, inside the transaction that runs the COPY.
+	TailRows int64
+
+	// TailReportColumn names the column whose min/max over the exported window goes into the
+	// manifest, or "" for none
+	TailReportColumn string
+
 	// SelectSQL is the statement the export wraps in COPY (...) TO STDOUT
 	SelectSQL string
 }
@@ -51,6 +61,10 @@ func BuildProjection(t catalog.Table, cfg Config, salt string) (*Projection, err
 		Columns:    make([]string, 0, len(t.Columns)),
 		Transforms: map[string]string{},
 	}
+	if tc.TailRows != nil {
+		p.TailRows = *tc.TailRows
+		p.TailReportColumn = tc.TailReportColumn
+	}
 
 	byName := make(map[string]catalog.Column, len(t.Columns))
 	for _, col := range t.Columns {
@@ -58,6 +72,20 @@ func BuildProjection(t catalog.Table, cfg Config, salt string) (*Projection, err
 	}
 
 	errs := make([]error, 0)
+
+	if tc.TailReportColumn != "" {
+		_, exists := byName[tc.TailReportColumn]
+		switch {
+		case !exists:
+			errs = append(errs, fmt.Errorf("table %q: no column %q for tail_report_column",
+				t.Qualified(), tc.TailReportColumn))
+		case strings.TrimSpace(tc.Columns[tc.TailReportColumn]) != "":
+			// The manifest ships to the bucket next to the data; recording a scrubbed column's
+			// real min/max there would leak the very range the rule exists to hide
+			errs = append(errs, fmt.Errorf("table %q: tail_report_column %q also has a column rule; "+
+				"the manifest would record the unscrubbed range", t.Qualified(), tc.TailReportColumn))
+		}
+	}
 
 	// Rules are resolved against the schema first, so a stale rule is reported even when the
 	// table is skipped and nothing would have used it
@@ -125,6 +153,21 @@ func BuildProjection(t catalog.Table, cfg Config, salt string) (*Projection, err
 // CopyOut renders the statement that streams this projection out of the source database
 func (p Projection) CopyOut() string {
 	return fmt.Sprintf("COPY (%s) TO STDOUT", p.SelectSQL)
+}
+
+// CopyOutTail renders the copy statement for the heap-tail window beginning at startPage.
+//
+// Appending WHERE directly is safe because tail_rows and `where` are mutually exclusive, so
+// SelectSQL never carries a filter of its own. No ORDER BY and no LIMIT, deliberately: a sort
+// materialises the rows and reintroduces the temp-disk blowup the ctid window exists to avoid.
+func (p Projection) CopyOutTail(startPage int64) string {
+	return fmt.Sprintf("COPY (%s WHERE %s) TO STDOUT", p.SelectSQL, TailPredicate(startPage))
+}
+
+// TailPredicate selects every row at or after a heap page. On the postgres versions this tool
+// supports it plans as a Tid Range Scan, which reads only the pages it names.
+func TailPredicate(startPage int64) string {
+	return fmt.Sprintf("ctid >= '(%d,0)'::tid", startPage)
 }
 
 // CopyIn renders the statement that loads this projection into the target database.

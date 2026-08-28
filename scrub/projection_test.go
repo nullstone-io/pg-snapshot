@@ -100,6 +100,49 @@ func TestBuildProjection(t *testing.T) {
 			p.SelectSQL)
 	})
 
+	t.Run("carries the tail request through", func(t *testing.T) {
+		n := int64(2000)
+		cfg := Config{Version: 1, Tables: map[string]TableConfig{
+			"public.users": {TailRows: &n, TailReportColumn: "created_at"},
+		}}
+
+		p, err := BuildProjection(usersTable(intCol("id"), textCol("created_at")), cfg, testSalt)
+		require.NoError(t, err)
+
+		assert.Equal(t, int64(2000), p.TailRows)
+		assert.Equal(t, "created_at", p.TailReportColumn)
+		// The window is sized at copy time; the base select stays unfiltered
+		assert.Equal(t, `SELECT "id", "created_at" FROM "public"."users"`, p.SelectSQL)
+	})
+
+	t.Run("tail_report_column must name a real column", func(t *testing.T) {
+		n := int64(2000)
+		cfg := Config{Version: 1, Tables: map[string]TableConfig{
+			"public.users": {TailRows: &n, TailReportColumn: "created_at"},
+		}}
+
+		_, err := BuildProjection(usersTable(intCol("id")), cfg, testSalt)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), `no column "created_at" for tail_report_column`)
+	})
+
+	// The manifest ships to the bucket; recording a scrubbed column's real range there would
+	// leak exactly what the rule hides
+	t.Run("tail_report_column cannot be a scrubbed column", func(t *testing.T) {
+		n := int64(2000)
+		cfg := Config{Version: 1, Tables: map[string]TableConfig{
+			"public.users": {
+				TailRows:         &n,
+				TailReportColumn: "email",
+				Columns:          map[string]string{"email": "email"},
+			},
+		}}
+
+		_, err := BuildProjection(usersTable(intCol("id"), textCol("email")), cfg, testSalt)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "also has a column rule")
+	})
+
 	t.Run("partitioned parent is never exported directly", func(t *testing.T) {
 		tbl := catalog.Table{Schema: "public", Name: "events", Kind: catalog.RelKindPartitioned}
 		_, err := BuildProjection(tbl, Config{Version: 1}, testSalt)
@@ -228,4 +271,10 @@ func TestCopyStatements(t *testing.T) {
 
 	assert.Equal(t, `COPY (SELECT "id", "email" FROM "public"."users") TO STDOUT`, p.CopyOut())
 	assert.Equal(t, `COPY "public"."users" ("id", "email") FROM STDIN`, p.CopyIn())
+
+	// No ORDER BY and no LIMIT: a sort would reintroduce the temp-disk blowup the ctid window
+	// exists to avoid
+	assert.Equal(t,
+		`COPY (SELECT "id", "email" FROM "public"."users" WHERE ctid >= '(1187,0)'::tid) TO STDOUT`,
+		p.CopyOutTail(1187))
 }

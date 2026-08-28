@@ -213,6 +213,14 @@ Semantics:
 - `mode: skip` keeps the table's schema and exports zero rows.
 - `where` filters rows. **This can break foreign keys** — filtering a parent orphans its
   children and `post-data` FK creation fails. `fk_mode: not_valid` is the escape hatch.
+- `tail_rows: n` exports ≈ the newest `n` rows by physical heap position, via a `ctid` window
+  over the heap's trailing pages (a Tid Range Scan). For large append-only tables where `where`
+  would seq-scan everything and an `ORDER BY … LIMIT` would sort it. Sized from
+  `pg_relation_size` plus a live-density probe of the tail pages, with a margin, so it overshoots
+  `n` rather than undershooting. Same FK caveat as `where`; mutually exclusive with `where` and
+  `mode: skip`. The manifest records the window (pages read, actual rows, and the min/max of an
+  optional `tail_report_column`) because the tail-is-newest assumption degrades silently under
+  UPDATE traffic or after a `VACUUM FULL`.
 - `:salt` is a per-run random value, held in memory and never written to the manifest.
   Deterministic within a run, rotating between runs.
 

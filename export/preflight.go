@@ -150,7 +150,17 @@ func (p Preflight) Run(ctx context.Context) (*Report, error) {
 		}
 	}
 
-	// The loop above is driven by what the database contains, so a rule naming a table that is
+	// The report column of every tail-sampled table is type-checked here, over no rows, rather
+	// than discovered to be un-aggregatable mid-run after other tables have already streamed
+	for _, prj := range report.Plan {
+		if prj.TailRows > 0 && prj.TailReportColumn != "" {
+			if err := checkTailReportColumn(ctx, p.DB, prj); err != nil {
+				planErrs = append(planErrs, err)
+			}
+		}
+	}
+
+	// The planning loop is driven by what the database contains, so a rule naming a table that is
 	// not there is never visited and never validated. That is the same class of problem as a rule
 	// naming a dropped column, and it is the one that catches a connection pointed at the wrong
 	// database -- every rule misses at once.
