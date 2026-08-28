@@ -27,6 +27,11 @@ type Projection struct {
 	// written to the bucket alongside the data.
 	Transforms map[string]string
 
+	// Where is the configured row filter, carried for the manifest. The predicate is already
+	// baked into SelectSQL; this copy exists so the manifest can explain a row count that does
+	// not match production.
+	Where string
+
 	// TailRows is the requested heap-tail sample size; 0 exports the table in full.
 	//
 	// The projection only carries the request: the window itself depends on the table's live
@@ -58,6 +63,7 @@ func BuildProjection(t catalog.Table, cfg Config, salt string) (*Projection, err
 	p := &Projection{
 		Table:      t,
 		Skipped:    tc.Mode == TableModeSkip,
+		Where:      tc.Where,
 		Columns:    make([]string, 0, len(t.Columns)),
 		Transforms: map[string]string{},
 	}

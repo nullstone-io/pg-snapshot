@@ -98,6 +98,8 @@ func TestBuildProjection(t *testing.T) {
 		assert.Equal(t,
 			`SELECT "id" FROM "public"."users" WHERE created_at > now() - interval '30 days'`,
 			p.SelectSQL)
+		// Carried separately from SelectSQL so the manifest can record the filter that was applied
+		assert.Equal(t, "created_at > now() - interval '30 days'", p.Where)
 	})
 
 	t.Run("carries the tail request through", func(t *testing.T) {

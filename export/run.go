@@ -310,6 +310,7 @@ func copyOne(ctx context.Context, pool *pgxpool.Pool, store blobstore.Store, lay
 		Schema:     p.Table.Schema,
 		Name:       p.Table.Name,
 		Skipped:    p.Skipped,
+		Where:      p.Where,
 		Columns:    p.Columns,
 		Transforms: p.Transforms,
 	}
