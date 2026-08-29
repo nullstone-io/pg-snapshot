@@ -13,8 +13,12 @@ import (
 type Projection struct {
 	Table catalog.Table
 
-	// Skipped reports mode: skip -- the table's structure is snapshotted but none of its rows
+	// Skipped reports that none of the table's rows are exported -- mode: skip or skip-data
 	Skipped bool
+
+	// Excluded reports mode: skip -- the table is left out of the schema dump as well, so it does
+	// not exist in a restored database at all. Implies Skipped.
+	Excluded bool
 
 	// Columns is the exported column list in SELECT order. The restore replays it verbatim as
 	// the column list of its COPY ... FROM STDIN, so the two stay aligned even when the target
@@ -62,7 +66,8 @@ func BuildProjection(t catalog.Table, cfg Config, salt string) (*Projection, err
 
 	p := &Projection{
 		Table:      t,
-		Skipped:    tc.Mode == TableModeSkip,
+		Skipped:    tc.Mode.SkipsData(),
+		Excluded:   tc.Mode == TableModeSkip,
 		Where:      tc.Where,
 		Columns:    make([]string, 0, len(t.Columns)),
 		Transforms: map[string]string{},

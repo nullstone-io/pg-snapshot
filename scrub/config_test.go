@@ -19,13 +19,15 @@ tables:
       ssn: "null"
   public.audit_logs:
     mode: skip
+  public.legacy_imports:
+    mode: skip-data
   public.events:
     where: "created_at > now() - interval '30 days'"
 `))
 		require.NoError(t, err)
 
 		assert.Equal(t, FKModeNotValid, cfg.FKMode)
-		assert.Len(t, cfg.Tables, 3)
+		assert.Len(t, cfg.Tables, 4)
 
 		users, ok := cfg.TableConfigFor("public", "users")
 		require.True(t, ok)
@@ -34,6 +36,11 @@ tables:
 
 		logs, _ := cfg.TableConfigFor("public", "audit_logs")
 		assert.Equal(t, TableModeSkip, logs.Mode)
+		assert.True(t, logs.Mode.SkipsData())
+
+		imports, _ := cfg.TableConfigFor("public", "legacy_imports")
+		assert.Equal(t, TableModeSkipData, imports.Mode)
+		assert.True(t, imports.Mode.SkipsData())
 
 		events, _ := cfg.TableConfigFor("public", "events")
 		assert.Equal(t, "created_at > now() - interval '30 days'", events.Where)
@@ -112,6 +119,35 @@ func TestConfigValidate(t *testing.T) {
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "`where` has no effect with mode: skip")
 		assert.Contains(t, err.Error(), "`columns` has no effect with mode: skip")
+	})
+
+	// Neither skip mode exports rows, so both make the same rules dead letters
+	t.Run("rejects rules that skip-data mode would ignore", func(t *testing.T) {
+		err := Config{
+			Version: 1,
+			Tables: map[string]TableConfig{
+				"public.users": {
+					Mode:    TableModeSkipData,
+					Where:   "id > 0",
+					Columns: map[string]string{"email": "email"},
+				},
+			},
+		}.Validate()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "`where` has no effect with mode: skip-data")
+		assert.Contains(t, err.Error(), "`columns` has no effect with mode: skip-data")
+	})
+
+	// The two modes differ only in whether the structure comes along, so an operator who reaches
+	// for the wrong one has to be told the other exists
+	t.Run("names both modes when one is misspelled", func(t *testing.T) {
+		err := Config{
+			Version: 1,
+			Tables:  map[string]TableConfig{"public.users": {Mode: "skip_data"}},
+		}.Validate()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), `invalid mode "skip_data"`)
+		assert.Contains(t, err.Error(), "skip, skip-data")
 	})
 
 	t.Run("parses tail_rows", func(t *testing.T) {

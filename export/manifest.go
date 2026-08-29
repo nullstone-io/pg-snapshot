@@ -54,8 +54,14 @@ type TableEntry struct {
 	Schema string `json:"schema"`
 	Name   string `json:"name"`
 
-	// Skipped means the structure is in the schema dump but no rows were exported
+	// Skipped means no rows were exported -- mode: skip or mode: skip-data
 	Skipped bool `json:"skipped"`
+
+	// Excluded means mode: skip: the structure is not in the schema dump either, so the table
+	// does not exist in a restored database. Recorded because "the table is missing" and "the
+	// table is empty" are different questions, and the manifest is where both are answered.
+	// Implies Skipped.
+	Excluded bool `json:"excluded,omitempty"`
 
 	// Where is the row filter that was applied, if any. Recorded because it explains a row count
 	// that does not match production, and because it is what makes fkMode meaningful.

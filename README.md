@@ -41,7 +41,9 @@ tables:
       ssn:       "null"
       last_name: md5          # deterministic, preserves joins
   public.audit_logs:
-    mode: skip                # structure only, no rows
+    mode: skip-data           # structure only, no rows
+  public.other_teams_table:
+    mode: skip                # not in the snapshot at all
   public.events:
     where: "created_at > now() - interval '30 days'"
 ```
@@ -58,6 +60,33 @@ applies or is reported; silently not applying is the one outcome worse than no r
 
 Row filtering with `where` can orphan child rows and break foreign key creation on restore. Set
 `fk_mode: not_valid` when that is intentional.
+
+### Leaving a table out: `skip` and `skip-data`
+
+| mode | rows | structure | needs `SELECT` on the table |
+|---|---|---|---|
+| `skip-data` | no | yes — restores empty | **yes** |
+| `skip` | no | no — not in the artifact | no |
+
+The privilege column is the whole reason there are two. `pg_dump` takes an `ACCESS SHARE` lock on
+every table it dumps, `--schema-only` included, and that lock requires `SELECT` on the table — so a
+table the snapshot role cannot read fails the schema dump for the *entire* database, in one
+`LOCK TABLE` naming every table at once:
+
+```
+pg_dump: error: query failed: ERROR:  permission denied for table other_teams_table
+pg_dump: detail: Query was: LOCK TABLE public.users, public.events, … IN ACCESS SHARE MODE
+```
+
+`mode: skip` passes `--exclude-table` for that table, so `pg_dump` never asks for it and never
+locks it. `mode: skip-data` does not and cannot: it keeps the table's structure, which only
+`pg_dump` can produce. Grant the read, or exclude the table — those are the two options, and
+preflight says which one applies before anything moves.
+
+Excluding a table removes it from the restored database entirely, so anything left behind that
+refers to it — a foreign key on a table that *is* exported, a view, a SQL-bodied function — would
+fail on restore. Preflight names those dependents and refuses the snapshot rather than writing an
+artifact that cannot be loaded.
 
 ### Sampling large append-only tables with `tail_rows`
 
@@ -92,7 +121,7 @@ Three things to know:
 - **It is a row filter, exactly like `where`.** Rows in other tables that reference excluded rows
   become orphans, and FK creation on restore fails unless `fk_mode: not_valid` is set.
 
-`tail_rows` is mutually exclusive with `mode: skip` and with `where`, and composes normally with
+`tail_rows` is mutually exclusive with both skip modes and with `where`, and composes normally with
 `columns` scrubbing. On partitioned tables, configure the leaf partitions (as with every rule);
 `n` then applies per partition. Each tail-sampled table records its window in the manifest:
 requested rows, pages read of total, actual exported row count, and the report column's min/max.

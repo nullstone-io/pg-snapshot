@@ -76,7 +76,7 @@ func TestBuildProjection(t *testing.T) {
 		assert.Equal(t, []string{"id"}, p.Columns)
 	})
 
-	t.Run("skip mode exports no rows", func(t *testing.T) {
+	t.Run("skip mode exports no rows and no structure", func(t *testing.T) {
 		cfg := Config{Version: 1, Tables: map[string]TableConfig{
 			"public.users": {Mode: TableModeSkip},
 		}}
@@ -85,6 +85,22 @@ func TestBuildProjection(t *testing.T) {
 		require.NoError(t, err)
 
 		assert.True(t, p.Skipped)
+		assert.True(t, p.Excluded, "skip keeps the table out of the schema dump as well")
+		assert.Empty(t, p.SelectSQL)
+	})
+
+	// The difference that matters downstream: an excluded table is never handed to pg_dump, so
+	// its grants stop mattering; a skip-data table is, so they still do
+	t.Run("skip-data mode exports no rows but keeps the structure", func(t *testing.T) {
+		cfg := Config{Version: 1, Tables: map[string]TableConfig{
+			"public.users": {Mode: TableModeSkipData},
+		}}
+
+		p, err := BuildProjection(usersTable(intCol("id")), cfg, testSalt)
+		require.NoError(t, err)
+
+		assert.True(t, p.Skipped)
+		assert.False(t, p.Excluded)
 		assert.Empty(t, p.SelectSQL)
 	})
 

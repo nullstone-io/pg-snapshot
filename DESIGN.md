@@ -163,9 +163,9 @@ snapshot aborted: 2 tables cannot be exported in full by role "ns_snapshot_a1b2"
   public.billing_events    owner=app_core   RLS=on   FORCE=yes
       → owner membership will NOT help; FORCE ROW LEVEL SECURITY is set.
         Grant BYPASSRLS (requires a true superuser — unavailable on both
-        Cloud SQL and RDS), or exclude the table:
+        Cloud SQL and RDS), or export the table empty:
           tables:
-            public.billing_events: { mode: skip }
+            public.billing_events: { mode: skip-data }
 
 No data was exported.
 ```
@@ -200,7 +200,9 @@ tables:
       ssn:        "null"
       last_name:  "md5(last_name || :salt)"              # deterministic → preserves joins
   public.audit_logs:
-    mode: skip                                            # schema only, no rows
+    mode: skip-data                                       # schema only, no rows
+  public.other_teams_table:
+    mode: skip                                            # not in the snapshot at all
   public.events:
     where: "created_at > now() - interval '30 days'"
 ```
@@ -210,7 +212,14 @@ Semantics:
 - Unlisted columns export as-is. The config declares what to scrub; that is the whole
   contract. The tool does not guess at what is sensitive.
 - Unlisted tables export in full.
-- `mode: skip` keeps the table's schema and exports zero rows.
+- `mode: skip-data` keeps the table's schema and exports zero rows; it restores empty.
+- `mode: skip` leaves the table out of the artifact entirely — `pg_dump` is passed
+  `--exclude-table` for it. This is the only mode available for a table the snapshot role cannot
+  read: `pg_dump` locks every table it dumps in `ACCESS SHARE`, `--schema-only` included, and that
+  lock requires `SELECT`, so one unreadable table otherwise fails the schema dump for the whole
+  database. Preflight refuses an exclusion that would strand a dependent — an inbound foreign key,
+  a view, a SQL-bodied function — because that failure otherwise surfaces at restore time, one
+  artifact too late.
 - `where` filters rows. **This can break foreign keys** — filtering a parent orphans its
   children and `post-data` FK creation fails. `fk_mode: not_valid` is the escape hatch.
 - `tail_rows: n` exports ≈ the newest `n` rows by physical heap position, via a `ctid` window
@@ -218,7 +227,7 @@ Semantics:
   would seq-scan everything and an `ORDER BY … LIMIT` would sort it. Sized from
   `pg_relation_size` plus a live-density probe of the tail pages, with a margin, so it overshoots
   `n` rather than undershooting. Same FK caveat as `where`; mutually exclusive with `where` and
-  `mode: skip`. The manifest records the window (pages read, actual rows, and the min/max of an
+  either skip mode. The manifest records the window (pages read, actual rows, and the min/max of an
   optional `tail_report_column`) because the tail-is-newest assumption degrades silently under
   UPDATE traffic or after a `VACUUM FULL`.
 - `:salt` is a per-run random value, held in memory and never written to the manifest.
@@ -560,7 +569,7 @@ PG 16 as the floor removes: the `pg_read_all_data` availability check (14+), the
    The handling stays in the tool — this is a public OSS project and other users will have
    RLS. It remains the one condition that can make a table unexportable: owner membership does
    not help when `FORCE` is set, only `BYPASSRLS` does, and that is unavailable on both
-   Cloud SQL and RDS. Affected tables must be excluded via `mode: skip`.
+   Cloud SQL and RDS. Affected tables must be exported empty via `mode: skip-data`.
 
    ```sql
    SELECT n.nspname, c.relname, c.relforcerowsecurity

@@ -88,3 +88,19 @@ func TestParseTocEntryIgnoresUnknownDescriptions(t *testing.T) {
 	_, ok := ParseTocEntry("210; 1259 16640 TABLE public users postgres")
 	assert.False(t, ok)
 }
+
+// pg_dump reads --exclude-table as a pattern, so an unquoted name is not the name: `*`, `?` and
+// `[` are wildcards and unquoted letters fold to lower case. A pattern that excludes more than the
+// table it names would silently drop tables the snapshot is supposed to carry.
+func TestExcludeTablePattern(t *testing.T) {
+	assert.Equal(t, `"public"."eng1189_keep"`, ExcludeTablePattern("public", "eng1189_keep"))
+
+	// Case survives, so a table created as "Orders" is not confused with "orders"
+	assert.Equal(t, `"public"."Orders"`, ExcludeTablePattern("public", "Orders"))
+
+	// Wildcards in a real table name match themselves rather than a pattern
+	assert.Equal(t, `"public"."weird[name]"`, ExcludeTablePattern("public", "weird[name]"))
+
+	// A quote inside an identifier is doubled, the way postgres quotes it
+	assert.Equal(t, `"public"."od""d"`, ExcludeTablePattern("public", `od"d`))
+}

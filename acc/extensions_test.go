@@ -58,7 +58,7 @@ func TestUseListSkipsExtensionsWithoutDroppingTheSection(t *testing.T) {
 	))
 
 	archive := filepath.Join(t.TempDir(), "schema.dump")
-	require.NoError(t, pg.DumpSchema(ctx, sourceURL, archive, ""))
+	require.NoError(t, pg.DumpSchema(ctx, sourceURL, archive, "", nil))
 
 	toc, err := pg.ListArchive(ctx, archive)
 	require.NoError(t, err)

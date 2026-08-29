@@ -36,7 +36,13 @@ const (
 // snapshotID joins pg_dump to the export's own transaction snapshot, so the schema it captures is
 // the schema the data was copied under. Without it the two are read at different instants and a
 // migration landing mid-snapshot produces an artifact whose structure and rows disagree.
-func DumpSchema(ctx context.Context, url, outPath, snapshotID string) error {
+//
+// excludeTables are patterns from ExcludeTablePattern, one per table left out of the snapshot
+// entirely. This is the only way to keep a table out of the dump, and it is what makes such a
+// table exportable by a role that cannot read it: pg_dump locks every table it dumps in ACCESS
+// SHARE, --schema-only included, and that lock needs SELECT on the table. One it was never asked
+// to dump is neither locked nor read.
+func DumpSchema(ctx context.Context, url, outPath, snapshotID string, excludeTables []string) error {
 	args := []string{
 		"--format=custom",
 		"--schema-only",
@@ -50,7 +56,23 @@ func DumpSchema(ctx context.Context, url, outPath, snapshotID string) error {
 	if snapshotID != "" {
 		args = append(args, "--snapshot="+snapshotID)
 	}
+	for _, pattern := range excludeTables {
+		args = append(args, "--exclude-table="+pattern)
+	}
 	return run(ctx, "pg_dump", append(args, url)...)
+}
+
+// ExcludeTablePattern renders one table as a pg_dump --exclude-table pattern.
+//
+// pg_dump reads that argument as a pattern rather than a name: `*`, `?` and `[` are wildcards
+// there, and an unquoted letter folds to lower case the way an unquoted SQL identifier does. Both
+// halves are quoted so a table excludes itself and only itself, whatever its name contains.
+func ExcludeTablePattern(schema, table string) string {
+	return quotePatternPart(schema) + "." + quotePatternPart(table)
+}
+
+func quotePatternPart(s string) string {
+	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
 }
 
 // ListArchive reads an archive's table of contents, one entry per line.

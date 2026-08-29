@@ -8,6 +8,7 @@ import (
 
 	"github.com/go-multierror/multierror"
 	"github.com/nullstone-io/pg-snapshot/catalog"
+	"github.com/nullstone-io/pg-snapshot/pg"
 	"github.com/nullstone-io/pg-snapshot/scrub"
 )
 
@@ -71,6 +72,28 @@ func (r Report) ServerMajor() int {
 	return r.ServerVersionNum / 10000
 }
 
+// ExcludedTables lists the tables mode: skip leaves out of the snapshot entirely, in plan order.
+func (r Report) ExcludedTables() []string {
+	out := make([]string, 0)
+	for _, p := range r.Plan {
+		if p.Excluded {
+			out = append(out, p.Table.Qualified())
+		}
+	}
+	return out
+}
+
+// ExcludeTablePatterns renders the excluded tables as the pg_dump patterns the schema dump takes.
+func (r Report) ExcludeTablePatterns() []string {
+	out := make([]string, 0)
+	for _, p := range r.Plan {
+		if p.Excluded {
+			out = append(out, pg.ExcludeTablePattern(p.Table.Schema, p.Table.Name))
+		}
+	}
+	return out
+}
+
 // Schemas lists the distinct schemas the plan covers, in order.
 func (r Report) Schemas() []string {
 	seen := map[string]bool{}
@@ -129,14 +152,22 @@ func (p Preflight) Run(ctx context.Context) (*Report, error) {
 		}
 		report.Plan = append(report.Plan, *projection)
 
-		// A table the user chose not to export needs no access to it
-		if projection.Skipped {
+		// A table left out of the snapshot entirely is neither dumped nor copied, so no access to
+		// it is needed. mode: skip-data is not that: its structure still comes from pg_dump, which
+		// locks every table it dumps, and that lock needs SELECT. Reading the two modes as one is
+		// what let a table the role could not read reach pg_dump behind a clean preflight.
+		if projection.Excluded {
 			continue
 		}
 		if cols := unreadable[t.Qualified()]; len(cols) > 0 {
 			report.Findings = append(report.Findings, Finding{
 				Table: t.Qualified(), Owner: t.Owner, Kind: FindingNoSelect, Columns: cols,
 			})
+			continue
+		}
+		// Row security filters rows, and a skip-data table exports none, so there is nothing left
+		// for a policy to filter
+		if projection.Skipped {
 			continue
 		}
 		if t.RowSecurity && !exempt[t.Qualified()] {
@@ -147,6 +178,25 @@ func (p Preflight) Run(ctx context.Context) (*Report, error) {
 			report.Findings = append(report.Findings, Finding{
 				Table: t.Qualified(), Owner: t.Owner, Kind: kind,
 			})
+		}
+	}
+
+	// A table mode: skip removes from the schema dump takes nothing else with it -- pg_dump still
+	// emits every view, function and foreign key that referenced it, and pg_restore is where they
+	// fail on a relation that is not there. That is an hour of export and an artifact in the
+	// bucket away from here, so the dependents are read now, while the fix is still a config edit.
+	if excluded := report.ExcludedTables(); len(excluded) > 0 {
+		dependents, err := p.excludedDependents(ctx, excluded)
+		if err != nil {
+			return report, err
+		}
+		for _, name := range excluded {
+			if deps := dependents[name]; len(deps) > 0 {
+				planErrs = append(planErrs, fmt.Errorf("table %q is left out of the snapshot by "+
+					"mode: skip, but %s still depends on it and the restore would fail creating it; "+
+					"exclude the dependent as well, or use mode: skip-data to keep the table's "+
+					"structure (which needs SELECT on the table)", name, strings.Join(deps, ", ")))
+			}
 		}
 	}
 
@@ -209,7 +259,9 @@ func (r Report) Err() error {
 		case FindingNoSelect:
 			fmt.Fprintf(&b, "  %-24s owner=%s\n", f.Table, f.Owner)
 			fmt.Fprintf(&b, "      → no SELECT on: %s\n", strings.Join(f.Columns, ", "))
-			fmt.Fprintf(&b, "        grant it, or exclude the table:\n")
+			// Not skip-data: without SELECT the role cannot lock the table, and pg_dump locks
+			// every table whose structure it dumps. Only full exclusion keeps it out of reach.
+			fmt.Fprintf(&b, "        grant it, or leave the table out of the snapshot entirely:\n")
 			fmt.Fprintf(&b, "          tables:\n            %s: { mode: skip }\n", f.Table)
 
 		case FindingRowSecurity:
@@ -223,13 +275,87 @@ func (r Report) Err() error {
 			fmt.Fprintf(&b, "  %-24s owner=%s   RLS=on   FORCE=yes\n", f.Table, f.Owner)
 			fmt.Fprintf(&b, "      → owner membership will NOT help; FORCE ROW LEVEL SECURITY is set.\n")
 			fmt.Fprintf(&b, "        Grant BYPASSRLS (requires a true superuser — unavailable on\n")
-			fmt.Fprintf(&b, "        both Cloud SQL and RDS), or exclude the table:\n")
-			fmt.Fprintf(&b, "          tables:\n            %s: { mode: skip }\n", f.Table)
+			fmt.Fprintf(&b, "        both Cloud SQL and RDS), or export the table empty:\n")
+			// What a policy withholds here is rows, and the role can still read the structure --
+			// so skip-data is the narrower fix. mode: skip drops the table from the artifact too.
+			fmt.Fprintf(&b, "          tables:\n            %s: { mode: skip-data }\n", f.Table)
 		}
 	}
 
 	b.WriteString("\nNo data was exported.")
 	return fmt.Errorf("%s", b.String())
+}
+
+// excludedDependentsSql finds the objects that would outlive a table mode: skip removes.
+//
+// Three kinds reach a restore and fail there: a foreign key declared on a table that is still
+// exported, a view or materialized view built over the excluded table, and a function whose body
+// was parsed at creation (a SQL-standard body, the only kind postgres records a dependency for).
+// Each is matched through the catalog rather than by reading definitions, so a rename or a
+// schema-qualified reference cannot hide one.
+//
+// Dependents that are themselves excluded are not reported: they leave with the table.
+const excludedDependentsSql = `
+WITH excluded AS (
+    SELECT c.oid, n.nspname || '.' || c.relname AS qualified
+    FROM pg_catalog.pg_class c
+    JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname || '.' || c.relname = ANY($1)
+)
+SELECT DISTINCT * FROM (
+    SELECT e.qualified,
+           'foreign key ' || con.conname || ' on ' || cn.nspname || '.' || cl.relname AS dependent
+    FROM pg_catalog.pg_constraint con
+    JOIN excluded e ON e.oid = con.confrelid
+    JOIN pg_catalog.pg_class cl ON cl.oid = con.conrelid
+    JOIN pg_catalog.pg_namespace cn ON cn.oid = cl.relnamespace
+    WHERE con.contype = 'f'
+      AND con.conrelid NOT IN (SELECT oid FROM excluded)
+
+    UNION ALL
+
+    SELECT e.qualified,
+           CASE v.relkind WHEN 'm' THEN 'materialized view ' ELSE 'view ' END
+               || vn.nspname || '.' || v.relname
+    FROM pg_catalog.pg_depend d
+    JOIN excluded e ON e.oid = d.refobjid
+    JOIN pg_catalog.pg_rewrite rw ON rw.oid = d.objid
+    JOIN pg_catalog.pg_class v ON v.oid = rw.ev_class
+    JOIN pg_catalog.pg_namespace vn ON vn.oid = v.relnamespace
+    WHERE d.classid = 'pg_rewrite'::regclass
+      AND d.refclassid = 'pg_class'::regclass
+      AND v.oid NOT IN (SELECT oid FROM excluded)
+
+    UNION ALL
+
+    SELECT e.qualified,
+           'function ' || pn.nspname || '.' || p.proname
+    FROM pg_catalog.pg_depend d
+    JOIN excluded e ON e.oid = d.refobjid
+    JOIN pg_catalog.pg_proc p ON p.oid = d.objid
+    JOIN pg_catalog.pg_namespace pn ON pn.oid = p.pronamespace
+    WHERE d.classid = 'pg_proc'::regclass
+      AND d.refclassid = 'pg_class'::regclass
+) deps
+ORDER BY 1, 2`
+
+// excludedDependents maps each excluded table to the retained objects that still depend on it.
+func (p Preflight) excludedDependents(ctx context.Context, excluded []string) (map[string][]string, error) {
+	rows, err := p.DB.Query(ctx, excludedDependentsSql, excluded)
+	if err != nil {
+		return nil, fmt.Errorf("error checking dependencies on excluded tables: %w", err)
+	}
+	defer rows.Close()
+
+	out := map[string][]string{}
+	for rows.Next() {
+		var table, dependent string
+		if err := rows.Scan(&table, &dependent); err != nil {
+			return nil, fmt.Errorf("error checking dependencies on excluded tables: %w", err)
+		}
+		out[table] = append(out[table], dependent)
+	}
+	return out, rows.Err()
 }
 
 // unreadableColumnsSql finds columns the role cannot SELECT.

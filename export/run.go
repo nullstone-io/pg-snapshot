@@ -139,9 +139,15 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 
 	layout := blobstore.NewLayout(database, time.Now())
 
+	// Named rather than counted: a table missing from a restored database is a question someone
+	// asks weeks later, and the snapshot's own log is where the answer should already be
+	schemaArgs := []any{"path", layout.SchemaDump()}
+	if excluded := report.ExcludedTables(); len(excluded) > 0 {
+		schemaArgs = append(schemaArgs, "excludedTables", excluded)
+	}
 	if err := phases.Run(ctx, "upload schema", func() error {
-		return uploadSchema(ctx, opts, layout, snapshotID, log)
-	}, "path", layout.SchemaDump()); err != nil {
+		return uploadSchema(ctx, opts, layout, snapshotID, report.ExcludeTablePatterns(), log)
+	}, schemaArgs...); err != nil {
 		return nil, err
 	}
 
@@ -206,7 +212,9 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 //
 // pg_dump needs a real file, and the restore needs one too for parallel post-data, so the
 // artifact is a file at both ends and only travels as a stream in between.
-func uploadSchema(ctx context.Context, opts Options, layout blobstore.Layout, snapshotID string, log *slog.Logger) error {
+func uploadSchema(ctx context.Context, opts Options, layout blobstore.Layout, snapshotID string,
+	excludeTables []string, log *slog.Logger) error {
+
 	dir, err := os.MkdirTemp("", "pgsnap-schema-")
 	if err != nil {
 		return fmt.Errorf("error creating temp dir: %w", err)
@@ -214,7 +222,7 @@ func uploadSchema(ctx context.Context, opts Options, layout blobstore.Layout, sn
 	defer os.RemoveAll(dir)
 
 	path := filepath.Join(dir, "schema.dump")
-	if err := pg.DumpSchema(ctx, opts.ConnURL, path, snapshotID); err != nil {
+	if err := pg.DumpSchema(ctx, opts.ConnURL, path, snapshotID, excludeTables); err != nil {
 		return err
 	}
 
@@ -310,12 +318,17 @@ func copyOne(ctx context.Context, pool *pgxpool.Pool, store blobstore.Store, lay
 		Schema:     p.Table.Schema,
 		Name:       p.Table.Name,
 		Skipped:    p.Skipped,
+		Excluded:   p.Excluded,
 		Where:      p.Where,
 		Columns:    p.Columns,
 		Transforms: p.Transforms,
 	}
 	if p.Skipped {
-		log.Info("table skipped", "table", p.Table.Qualified())
+		if p.Excluded {
+			log.Info("table excluded", "table", p.Table.Qualified(), "structure", false)
+		} else {
+			log.Info("table skipped", "table", p.Table.Qualified(), "structure", true)
+		}
 		return entry, nil
 	}
 

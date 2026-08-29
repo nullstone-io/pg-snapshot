@@ -67,9 +67,25 @@ type TableMode string
 const (
 	// TableModeFull exports every row the Where clause admits
 	TableModeFull TableMode = ""
-	// TableModeSkip exports the table's structure but none of its rows
+
+	// TableModeSkip leaves the table out of the snapshot entirely: no rows, and no structure
+	// either. pg_dump is passed --exclude-table for it, which is what makes this the mode for a
+	// table the snapshot role cannot read: pg_dump takes an ACCESS SHARE lock on every table it
+	// dumps, even under --schema-only, and that lock needs SELECT. A table it was never asked to
+	// dump is never locked.
 	TableModeSkip TableMode = "skip"
+
+	// TableModeSkipData exports the table's structure but none of its rows, so the table arrives
+	// empty rather than missing. Its structure still comes out of pg_dump, so unlike
+	// TableModeSkip the role does still need SELECT on it.
+	TableModeSkipData TableMode = "skip-data"
 )
+
+// SkipsData reports whether the mode exports no rows. Both skip modes do; what separates them is
+// whether the table's structure comes along.
+func (m TableMode) SkipsData() bool {
+	return m == TableModeSkip || m == TableModeSkipData
+}
 
 type FKMode string
 
@@ -122,22 +138,22 @@ func (c Config) Validate() error {
 		}
 
 		switch tc.Mode {
-		case TableModeFull, TableModeSkip:
+		case TableModeFull, TableModeSkip, TableModeSkipData:
 		default:
-			errs = append(errs, fmt.Errorf("table %q: invalid mode %q, expected one of: skip", name, tc.Mode))
+			errs = append(errs, fmt.Errorf("table %q: invalid mode %q, expected one of: skip, skip-data", name, tc.Mode))
 		}
 
-		// A skipped table exports no rows, so a filter or a column rule on it would silently do
+		// Neither skip mode exports rows, so a filter or a column rule on one would silently do
 		// nothing -- report the contradiction instead of picking a winner
-		if tc.Mode == TableModeSkip {
+		if tc.Mode.SkipsData() {
 			if tc.Where != "" {
-				errs = append(errs, fmt.Errorf("table %q: `where` has no effect with mode: skip", name))
+				errs = append(errs, fmt.Errorf("table %q: `where` has no effect with mode: %s", name, tc.Mode))
 			}
 			if len(tc.Columns) > 0 {
-				errs = append(errs, fmt.Errorf("table %q: `columns` has no effect with mode: skip", name))
+				errs = append(errs, fmt.Errorf("table %q: `columns` has no effect with mode: %s", name, tc.Mode))
 			}
 			if tc.TailRows != nil {
-				errs = append(errs, fmt.Errorf("table %q: `tail_rows` has no effect with mode: skip", name))
+				errs = append(errs, fmt.Errorf("table %q: `tail_rows` has no effect with mode: %s", name, tc.Mode))
 			}
 		}
 
