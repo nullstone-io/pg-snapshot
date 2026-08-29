@@ -26,6 +26,10 @@ Foreign keys and triggers live in `pg_dump`'s `post-data` section, so they are c
 the data lands. Restoring into a fresh database means there is nothing to disable — no
 `session_replication_role`, and therefore no superuser requirement.
 
+Snapshots are filed under the database they were exported from, `<database>/<timestamp>/`, and a
+restore looks under the target's name. Set `SOURCE_DATABASE` when the two differ — restoring
+production's `patterniq` into a preview environment's `patterniq_poc2`.
+
 ## Scrub configuration
 
 The user decides what is sensitive. Columns the configuration does not mention are exported
@@ -156,6 +160,8 @@ COPY migrate.sh /app/migrate.sh
 ```
 S3_BUCKET_URL / S3_BUCKET_REGION      where the snapshots live
 MIGRATE_COMMAND                       e.g. /app/migrate.sh
+SOURCE_DATABASE                       only when the snapshot came from a
+                                      differently named database
 BACKUP_RETENTION                      previous targets to keep (default 1)
 ```
 

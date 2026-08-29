@@ -32,6 +32,10 @@ type Options struct {
 
 	Store blobstore.Store
 
+	// Source is the database the snapshot was taken from, when that is not Target: snapshots are
+	// filed in the bucket under the name they were exported from. Empty means the two share a name.
+	Source string
+
 	// Snapshot pins a timestamp; empty means the most recent
 	Snapshot string
 
@@ -345,10 +349,14 @@ func resolveSnapshot(ctx context.Context, opts Options, adminPool pg.Querier, lo
 	if err != nil {
 		return nil, "", err
 	}
-	// Snapshots are filed under the *source* database name, which is the target's name in the
-	// normal case of restoring production's `core` into another environment's `core`
+	// Snapshots are filed under the *source* database name. That is the target's name in the normal
+	// case of restoring production's `core` into another environment's `core`, and Source names it
+	// when the two differ.
 	if opts.Target != "" {
 		database = opts.Target
+	}
+	if opts.Source != "" {
+		database = opts.Source
 	}
 
 	snapshot := opts.Snapshot

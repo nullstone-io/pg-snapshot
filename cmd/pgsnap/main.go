@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/nullstone-io/pg-snapshot/blobstore"
@@ -64,6 +65,8 @@ Configuration is read from the environment, reusing Nullstone's built-in names w
   and the unprefixed one wins when both are set):
     TARGET_DATABASE     database to replace, e.g. core (required)
     OWNER_ROLE          role that owns the restored objects (required)
+    SOURCE_DATABASE     database the snapshot was taken from, when it is not
+                        named the same as the target, e.g. patterniq
     SNAPSHOT            pin a snapshot timestamp (default: newest)
     BACKUP_RETENTION    previous versions of the target to keep (default %d)
     MIGRATE_COMMAND     command that migrates the staging database
@@ -199,6 +202,8 @@ func runRestore(ctx context.Context, log *slog.Logger) error {
 		return err
 	}
 
+	// Defaulted to the target, so the usual same-name restore needs no setting at all.
+	source := orDefault(strings.TrimSpace(os.Getenv(sourceDatabaseEnvVar)), target)
 	snapshot := os.Getenv(snapshotEnvVar)
 	migrate := os.Getenv(migrateCommandEnvVar)
 	replication := boolEnv(replicationEnvVar, true)
@@ -209,6 +214,7 @@ func runRestore(ctx context.Context, log *slog.Logger) error {
 	log.Info("restore starting",
 		"version", version,
 		"target", target,
+		"source", source,
 		"owner", owner,
 		"bucket", store.String(),
 		"snapshot", orDefault(snapshot, "newest"),
@@ -220,6 +226,7 @@ func runRestore(ctx context.Context, log *slog.Logger) error {
 	result, err := restore.Run(ctx, restore.Options{
 		AdminURL:        url,
 		Target:          target,
+		Source:          source,
 		Owner:           owner,
 		Store:           store,
 		Snapshot:        snapshot,

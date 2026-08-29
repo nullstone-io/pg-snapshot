@@ -30,6 +30,7 @@ const (
 	scrubConfigFileEnvVar = "SCRUB_CONFIG_FILE"
 	numWorkersEnvVar      = "NUM_WORKERS"
 	targetDatabaseEnvVar  = "TARGET_DATABASE"
+	sourceDatabaseEnvVar  = "SOURCE_DATABASE"
 	ownerRoleEnvVar       = "OWNER_ROLE"
 	snapshotEnvVar        = "SNAPSHOT"
 	backupRetentionEnvVar = "BACKUP_RETENTION"
