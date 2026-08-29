@@ -207,6 +207,26 @@ func CommentOut(toc []string, drop func(TocEntry) bool) []string {
 	return out
 }
 
+// KeepOnly disables every entry except the ones keep selects.
+//
+// The inverse of CommentOut, for a pass that replays a handful of entries out of an archive.
+// Entries that fail to parse are commented out too: keep can only affirm what it can read.
+func KeepOnly(toc []string, keep func(TocEntry) bool) []string {
+	out := make([]string, 0, len(toc))
+	for _, line := range toc {
+		if !isEntryLine(line) {
+			out = append(out, line)
+			continue
+		}
+		if e, ok := ParseTocEntry(line); ok && keep(e) {
+			out = append(out, line)
+			continue
+		}
+		out = append(out, ";"+line)
+	}
+	return out
+}
+
 type RestoreOptions struct {
 	Section Section
 

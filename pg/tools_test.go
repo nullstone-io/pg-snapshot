@@ -48,6 +48,32 @@ func TestCommentOut(t *testing.T) {
 	assert.Len(t, got, len(toc))
 }
 
+func TestKeepOnly(t *testing.T) {
+	toc := []string{
+		";",
+		"; Archive created at 2026-08-05 01:21:47 UTC",
+		"2; 3079 16385 EXTENSION - pgcrypto ",
+		"3; 3079 16512 EXTENSION - google_vacuum_mgmt ",
+		"210; 1259 16640 TABLE public users postgres",
+		"",
+	}
+
+	got := KeepOnly(toc, func(e TocEntry) bool {
+		return e.Desc == DescExtension && e.Name == "pgcrypto"
+	})
+
+	// Header and blank lines survive untouched; the TABLE entry is commented even though its
+	// description is not one keep can be asked about
+	assert.Equal(t, []string{
+		";",
+		"; Archive created at 2026-08-05 01:21:47 UTC",
+		"2; 3079 16385 EXTENSION - pgcrypto ",
+		";3; 3079 16512 EXTENSION - google_vacuum_mgmt ",
+		";210; 1259 16640 TABLE public users postgres",
+		"",
+	}, got)
+}
+
 // A commented entry must not be read back as a live one, or filtering an already-filtered list
 // would resurrect it.
 func TestCommentedEntriesAreNotParsed(t *testing.T) {

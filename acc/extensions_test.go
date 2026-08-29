@@ -10,6 +10,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/nullstone-io/pg-snapshot/pg"
+	"github.com/nullstone-io/pg-snapshot/restore"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -99,6 +100,91 @@ func TestUseListSkipsExtensionsWithoutDroppingTheSection(t *testing.T) {
 		`SELECT attnotnull FROM pg_attribute
 		 WHERE attrelid = 'public.widgets'::regclass AND attname = 'name'`).Scan(&notNull))
 	assert.True(t, notNull)
+}
+
+// Managed Postgres gates CREATE EXTENSION on the *session* role's memberships -- rds_superuser on
+// RDS, cloudsqlsuperuser on Cloud SQL -- and pg_restore --role SET ROLEs those memberships away
+// before the first statement, so extensions replay in their own pass without --role. Plain
+// Postgres cannot reproduce the managed gate; what this proves is the split itself: the extension
+// ends up created by the session role, everything else by the owner.
+func TestExtensionsRestoreAsSessionRole(t *testing.T) {
+	pool, ctx := Connect(t)
+
+	source := "pgsnap_acc_extrole_src"
+	target := "pgsnap_acc_extrole_dst"
+	owner := "pgsnap_acc_extrole_owner"
+
+	drop := func() {
+		for _, db := range []string{source, target} {
+			pool.Exec(ctx, fmt.Sprintf(`DROP DATABASE IF EXISTS %s WITH (FORCE)`, db))
+		}
+		pool.Exec(ctx, fmt.Sprintf(`DROP ROLE IF EXISTS %s`, owner))
+	}
+	drop()
+	t.Cleanup(drop)
+
+	// The target is owned by the owner role, as Run creates staging databases: on PG15+ the
+	// database owner is what confers CREATE on the public schema
+	require.NoError(t, execAll(ctx, pool,
+		fmt.Sprintf(`CREATE ROLE %s`, owner),
+		fmt.Sprintf(`GRANT %s TO CURRENT_USER`, owner),
+		fmt.Sprintf(`CREATE DATABASE %s`, source),
+		fmt.Sprintf(`CREATE DATABASE %s OWNER %s`, target, owner),
+	))
+
+	sourceURL, err := withDatabase(URL(), source)
+	require.NoError(t, err)
+	targetURL, err := withDatabase(URL(), target)
+	require.NoError(t, err)
+
+	sourcePool, err := pg.Open(ctx, sourceURL, 1)
+	require.NoError(t, err)
+	defer sourcePool.Close()
+
+	require.NoError(t, execAll(ctx, sourcePool,
+		`CREATE EXTENSION IF NOT EXISTS pgcrypto`,
+		`CREATE TABLE public.widgets (id int PRIMARY KEY)`,
+	))
+
+	archive := filepath.Join(t.TempDir(), "schema.dump")
+	require.NoError(t, pg.DumpSchema(ctx, sourceURL, archive, "", nil))
+
+	// pgcrypto is available here, so the plan must route it to the extensions pass rather than
+	// dropping it, and must produce a main list with it commented out
+	filter, err := restore.PlanSchemaFilter(ctx, pool, archive, discardLogger())
+	require.NoError(t, err)
+	require.NotEmpty(t, filter.ExtensionsListPath)
+	require.NotEmpty(t, filter.ListPath)
+
+	require.NoError(t, pg.RestoreSection(ctx, targetURL, archive, pg.RestoreOptions{
+		Section:  pg.SectionPreData,
+		ListPath: filter.ExtensionsListPath,
+	}), "the extensions pass runs without --role")
+
+	require.NoError(t, pg.RestoreSection(ctx, targetURL, archive, pg.RestoreOptions{
+		Section:  pg.SectionPreData,
+		Role:     owner,
+		ListPath: filter.ListPath,
+	}), "the main pass must not trip over the already-created extension")
+
+	targetPool, err := pg.Open(ctx, targetURL, 1)
+	require.NoError(t, err)
+	defer targetPool.Close()
+
+	var sessionUser string
+	require.NoError(t, targetPool.QueryRow(ctx, `SELECT current_user`).Scan(&sessionUser))
+
+	var extOwner string
+	require.NoError(t, targetPool.QueryRow(ctx,
+		`SELECT r.rolname FROM pg_extension e JOIN pg_roles r ON r.oid = e.extowner
+		 WHERE e.extname = 'pgcrypto'`).Scan(&extOwner))
+	assert.Equal(t, sessionUser, extOwner, "the extension belongs to the session role")
+
+	var tableOwner string
+	require.NoError(t, targetPool.QueryRow(ctx,
+		`SELECT tableowner FROM pg_tables
+		 WHERE schemaname = 'public' AND tablename = 'widgets'`).Scan(&tableOwner))
+	assert.Equal(t, owner, tableOwner, "everything else still belongs to the owner role")
 }
 
 func execAll(ctx context.Context, pool *pgxpool.Pool, stmts ...string) error {

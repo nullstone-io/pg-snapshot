@@ -33,34 +33,53 @@ var replicationDescs = map[string]bool{
 	pg.DescSubscription:       true,
 }
 
-// PlanSchemaFilter decides which archive entries the target cannot or should not replay, and writes
-// a pg_restore --use-list file with those entries commented out. It returns an empty path when
-// there is nothing to filter.
+// SchemaFilter is the pair of --use-list files the schema archive is replayed through.
+type SchemaFilter struct {
+	// ExtensionsListPath selects only the extension entries the target can create. It is replayed
+	// first and without --role: managed Postgres gates CREATE EXTENSION on the session role's
+	// memberships (rds_superuser on RDS, cloudsqlsuperuser on Cloud SQL), and the SET ROLE that
+	// --role issues discards them. Empty when the archive creates no extensions.
+	ExtensionsListPath string
+
+	// ListPath is everything else, with extensions and replication commented out. Both sections
+	// replay through it. Empty when nothing needed filtering.
+	ListPath string
+}
+
+// PlanSchemaFilter decides which archive entries the target cannot or should not replay under
+// --role, and writes the pg_restore --use-list files that carry the decision.
 //
-// Two categories are handled, and they are filtered for different reasons:
+// Three categories are handled, for different reasons:
 //
 //   - Extensions the target cannot create. Managed Postgres installs its own -- google_vacuum_mgmt
 //     on AlloyDB, the various aws_* on RDS -- and a dump carries a CREATE EXTENSION for each. This
 //     is decided against the target, because one artifact is restored into several environments
 //     and which extensions exist is a property of each of them.
+//   - Extensions the target can create, moved to their own pass. They are not skippable -- the
+//     schema may depend on them -- but they cannot run under --role either, because the owner role
+//     is not a superuser member and CREATE EXTENSION is checked against the current role.
 //   - Publications and subscriptions, always. That one is a property of neither end; it is simply
 //     not something a snapshot should carry.
-func PlanSchemaFilter(ctx context.Context, db pg.Querier, archivePath string, log *slog.Logger) (string, error) {
+func PlanSchemaFilter(ctx context.Context, db pg.Querier, archivePath string, log *slog.Logger) (SchemaFilter, error) {
 	toc, err := pg.ListArchive(ctx, archivePath)
 	if err != nil {
-		return "", err
+		return SchemaFilter{}, err
 	}
 
 	unsupported, err := unsupportedExtensions(ctx, db, pg.ArchiveExtensions(toc))
 	if err != nil {
-		return "", err
+		return SchemaFilter{}, err
 	}
 
 	dropped := map[string][]string{}
+	creatable := 0
 	filtered := pg.CommentOut(toc, func(e pg.TocEntry) bool {
 		switch {
 		case e.Desc == pg.DescExtension && unsupported[e.Name]:
 			dropped[e.Desc] = append(dropped[e.Desc], e.Name)
+			return true
+		case e.Desc == pg.DescExtension:
+			creatable++
 			return true
 		case replicationDescs[e.Desc]:
 			dropped[e.Desc] = append(dropped[e.Desc], e.Name)
@@ -68,10 +87,6 @@ func PlanSchemaFilter(ctx context.Context, db pg.Querier, archivePath string, lo
 		}
 		return false
 	})
-
-	if len(dropped) < 1 {
-		return "", nil
-	}
 
 	// Loud rather than silent. Skipping is right for a provider's own extension and for
 	// replication, and wrong for an extension the schema actually uses -- only the operator can
@@ -82,12 +97,30 @@ func PlanSchemaFilter(ctx context.Context, db pg.Querier, archivePath string, lo
 			"reason", reasonFor(desc))
 	}
 
-	listPath := archivePath + ".list"
-	body := strings.Join(filtered, "\n")
-	if err := os.WriteFile(listPath, []byte(body), 0o600); err != nil {
-		return "", fmt.Errorf("error writing restore list: %w", err)
+	var out SchemaFilter
+	if creatable > 0 {
+		extensions := pg.KeepOnly(toc, func(e pg.TocEntry) bool {
+			return e.Desc == pg.DescExtension && !unsupported[e.Name]
+		})
+		out.ExtensionsListPath = archivePath + ".extensions.list"
+		if err := writeList(out.ExtensionsListPath, extensions); err != nil {
+			return SchemaFilter{}, err
+		}
 	}
-	return listPath, nil
+	if creatable > 0 || len(dropped) > 0 {
+		out.ListPath = archivePath + ".list"
+		if err := writeList(out.ListPath, filtered); err != nil {
+			return SchemaFilter{}, err
+		}
+	}
+	return out, nil
+}
+
+func writeList(path string, toc []string) error {
+	if err := os.WriteFile(path, []byte(strings.Join(toc, "\n")), 0o600); err != nil {
+		return fmt.Errorf("error writing restore list: %w", err)
+	}
+	return nil
 }
 
 func reasonFor(desc string) string {

@@ -181,16 +181,27 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 
 	// Asked of the admin connection rather than the staging one: extension availability is a
 	// property of the instance. The same list governs both sections.
-	listPath, err := PlanSchemaFilter(ctx, adminPool, schemaPath, log)
+	filter, err := PlanSchemaFilter(ctx, adminPool, schemaPath, log)
 	if err != nil {
 		return nil, err
 	}
 
 	if err := phases.Run(ctx, "restore schema", func() error {
+		// Extensions replay first and as the session role: managed Postgres checks CREATE
+		// EXTENSION against the current role's memberships (rds_superuser, cloudsqlsuperuser),
+		// which the SET ROLE issued by --role below would discard.
+		if filter.ExtensionsListPath != "" {
+			if err := pg.RestoreSection(ctx, stagingURL, schemaPath, pg.RestoreOptions{
+				Section:  pg.SectionPreData,
+				ListPath: filter.ExtensionsListPath,
+			}); err != nil {
+				return err
+			}
+		}
 		return pg.RestoreSection(ctx, stagingURL, schemaPath, pg.RestoreOptions{
 			Section:  pg.SectionPreData,
 			Role:     opts.Owner,
-			ListPath: listPath,
+			ListPath: filter.ListPath,
 		})
 	}, "section", pg.SectionPreData, "database", staging); err != nil {
 		return nil, err
@@ -224,7 +235,7 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 			Section:  pg.SectionPostData,
 			Jobs:     opts.Workers,
 			Role:     opts.Owner,
-			ListPath: listPath,
+			ListPath: filter.ListPath,
 		})
 	}, "section", pg.SectionPostData, "jobs", opts.Workers); err != nil {
 		return nil, err

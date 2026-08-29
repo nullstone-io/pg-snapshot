@@ -356,8 +356,11 @@ identity in `pg_stat_activity` and logs, independent rotation, and revoking it d
 2. Drop any orphaned `restored_*` from a prior failed run. Drop backups beyond
    `backup_retention` (default 1).
 3. `CREATE DATABASE restored_<id>` owned by the target owner role.
-4. `pg_restore --section=pre-data --role=<db-owner>` — serial; it is one DDL dependency chain
-   and fast.
+4. `pg_restore --section=pre-data` in two passes, both serial — one DDL dependency chain, fast.
+   Extensions first, *without* `--role`: managed Postgres gates `CREATE EXTENSION` on the
+   session role's memberships (`rds_superuser`, `cloudsqlsuperuser`), which the `SET ROLE`
+   issued by `--role` discards. Then everything else with `--role=<db-owner>`, extensions
+   commented out of its `--use-list`.
 5. **Parallel data load.** N workers, one `COPY <table> FROM STDIN` each, scheduled
    largest-object-first so workers finish together. No FKs or triggers exist yet, so order is
    irrelevant and there is no contention.
