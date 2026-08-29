@@ -14,8 +14,8 @@ import (
 // Configuration arrives entirely through the environment, and reuses Nullstone's built-in names
 // wherever one exists.
 //
-// That is what lets the restore be an ordinary app: attach `aws-postgres-access` and an S3 access
-// capability to it and most of this is already populated, with no pgsnap-specific wiring.
+// That is what lets the restore be an ordinary app: attach `aws-postgres-restore-access` and an S3
+// access capability to it and most of this is already populated, with no pgsnap-specific wiring.
 const (
 	// postgresURLEnvVar is the name Nullstone's postgres access capabilities already publish
 	postgresURLEnvVar = "POSTGRES_URL"
@@ -38,16 +38,29 @@ const (
 	logFormatEnvVar       = "LOG_FORMAT"
 	logLevelEnvVar        = "LOG_LEVEL"
 
+	// The postgres-restore-access capabilities publish these prefixed spellings, so attaching one
+	// configures a restore with no further wiring. The unprefixed names above are read first: an app
+	// that sets one explicitly is overriding the capability, and that has to keep working.
+	restoreTargetDatabaseEnvVar = "RESTORE_TARGET_DATABASE"
+	restoreOwnerRoleEnvVar      = "RESTORE_OWNER_ROLE"
+
 	defaultWorkerCount   = 4
 	defaultBackupsToKeep = 1
 )
 
 func requireEnv(name string) (string, error) {
-	value := strings.TrimSpace(os.Getenv(name))
-	if value == "" {
-		return "", fmt.Errorf("%s is required", name)
+	return requireAnyEnv(name)
+}
+
+// requireAnyEnv reads the first of names that is set, and names all of them when none is: a
+// caller who set the alias should not be told only about the primary spelling.
+func requireAnyEnv(names ...string) (string, error) {
+	for _, name := range names {
+		if value := strings.TrimSpace(os.Getenv(name)); value != "" {
+			return value, nil
+		}
 	}
-	return value, nil
+	return "", fmt.Errorf("%s is required", strings.Join(names, " or "))
 }
 
 // orDefault renders an unset value as something an operator can read, so a log line says

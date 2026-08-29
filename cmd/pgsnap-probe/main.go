@@ -14,7 +14,7 @@
 // Usage:
 //
 //	POSTGRES_URL='postgres://<restore-role>:<pw>@<host>:5432/postgres?sslmode=require' \
-//	TARGET_DATABASE=fortuna \
+//	TARGET_DATABASE=acme \
 //	go run ./cmd/pgsnap-probe
 //
 // Delete this command once the question is settled; it is a diagnostic, not a feature.

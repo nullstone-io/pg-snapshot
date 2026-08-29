@@ -140,10 +140,12 @@ Each module is a capability that grants appropriate permissions to allow the res
 - [aws-postgres-restore-access](https://github.com/nullstone-modules/aws-postgres-restore-access)
 - [gcp-postgres-restore-access](https://github.com/nullstone-modules/gcp-postgres-restore-access)
 
-The capability covers Postgres and only Postgres: it mints the restore role through `pg-db-admin`
-and publishes `POSTGRES_URL`, `RESTORE_TARGET_DATABASE`, `RESTORE_OWNER_ROLE` and
-`RESTORE_BACKUP_RETENTION`. Bucket access comes from `aws-s3-access` / `gcp-gcs-access`, and
-everything else is app configuration.
+The capability covers Postgres and only Postgres: it mints the restore role through `pg-db-admin`,
+ensures the target database and its owner role exist, and publishes `POSTGRES_URL`,
+`RESTORE_TARGET_DATABASE` and `RESTORE_OWNER_ROLE`. pgsnap accepts those last two as aliases for
+`TARGET_DATABASE` and `OWNER_ROLE`, so attaching the capability configures the restore's database
+names on its own. Bucket access comes from `aws-s3-access` / `gcp-gcs-access`, and everything else
+is app configuration.
 
 ```dockerfile
 FROM nullstone/pg-snapshot:v1.0.0
@@ -154,6 +156,7 @@ COPY migrate.sh /app/migrate.sh
 ```
 S3_BUCKET_URL / S3_BUCKET_REGION      where the snapshots live
 MIGRATE_COMMAND                       e.g. /app/migrate.sh
+BACKUP_RETENTION                      previous targets to keep (default 1)
 ```
 
 Run it with `restore` — the image's entrypoint is already `pgsnap`.

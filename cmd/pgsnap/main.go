@@ -59,7 +59,9 @@ Configuration is read from the environment, reusing Nullstone's built-in names w
     SCRUB_CONFIG        scrub configuration as yaml
     SCRUB_CONFIG_FILE   path to the same, when it is too large for an env var
 
-  restore:
+  restore (the postgres-restore-access capabilities publish the first two as
+  RESTORE_TARGET_DATABASE and RESTORE_OWNER_ROLE; either spelling is accepted,
+  and the unprefixed one wins when both are set):
     TARGET_DATABASE     database to replace, e.g. core (required)
     OWNER_ROLE          role that owns the restored objects (required)
     SNAPSHOT            pin a snapshot timestamp (default: newest)
@@ -175,11 +177,11 @@ func runRestore(ctx context.Context, log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	target, err := requireEnv(targetDatabaseEnvVar)
+	target, err := requireAnyEnv(targetDatabaseEnvVar, restoreTargetDatabaseEnvVar)
 	if err != nil {
 		return err
 	}
-	owner, err := requireEnv(ownerRoleEnvVar)
+	owner, err := requireAnyEnv(ownerRoleEnvVar, restoreOwnerRoleEnvVar)
 	if err != nil {
 		return err
 	}
@@ -244,7 +246,7 @@ func runRepair(ctx context.Context, log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	target, err := requireEnv(targetDatabaseEnvVar)
+	target, err := requireAnyEnv(targetDatabaseEnvVar, restoreTargetDatabaseEnvVar)
 	if err != nil {
 		return err
 	}

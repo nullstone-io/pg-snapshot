@@ -12,7 +12,7 @@ func TestExtensionEntries(t *testing.T) {
 	toc := []string{
 		";",
 		"; Archive created at 2026-08-05 01:21:47 UTC",
-		";     dbname: fortuna",
+		";     dbname: acme",
 		";",
 		"; Selected TOC Entries:",
 		";",
@@ -65,8 +65,8 @@ func TestParseTocEntryMultiWordDescriptions(t *testing.T) {
 		want TocEntry
 	}{
 		{
-			"3460; 6106 16789 PUBLICATION - fortuna_ds_pub postgres",
-			TocEntry{Desc: DescPublication, Schema: "-", Name: "fortuna_ds_pub"},
+			"3460; 6106 16789 PUBLICATION - acme_ds_pub postgres",
+			TocEntry{Desc: DescPublication, Schema: "-", Name: "acme_ds_pub"},
 		},
 		{
 			"3461; 6108 16790 PUBLICATION TABLES IN SCHEMA - public postgres",
