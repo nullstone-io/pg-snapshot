@@ -20,6 +20,16 @@ const MinServerMajor = 16
 // is aliased `n`.
 const systemSchemas = `n.nspname NOT LIKE 'pg\_%' AND n.nspname <> 'information_schema'`
 
+// notExtensionMember excludes relations that belong to an extension, e.g. postgis's
+// spatial_ref_sys. Their contents are the extension's business: CREATE EXTENSION on the restore
+// side populates them for the target's own version, and carrying the source's copy collides with
+// that on load. Assumes the relation is aliased `c`.
+const notExtensionMember = `NOT EXISTS (
+  SELECT 1 FROM pg_catalog.pg_depend ed
+  WHERE ed.classid = 'pg_class'::regclass AND ed.objid = c.oid
+    AND ed.refclassid = 'pg_extension'::regclass AND ed.deptype = 'e'
+)`
+
 type Introspector struct {
 	DB pg.Querier
 }
@@ -53,7 +63,7 @@ JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
 LEFT JOIN pg_catalog.pg_inherits i ON i.inhrelid = c.oid AND c.relispartition
 LEFT JOIN pg_catalog.pg_class p ON p.oid = i.inhparent
 LEFT JOIN pg_catalog.pg_namespace pn ON pn.oid = p.relnamespace
-WHERE c.relkind IN ('r', 'p') AND ` + systemSchemas + `
+WHERE c.relkind IN ('r', 'p') AND ` + systemSchemas + ` AND ` + notExtensionMember + `
 ORDER BY n.nspname, c.relname`
 
 // columnsSql reads every attribute of every table in one pass, rather than a query per table.

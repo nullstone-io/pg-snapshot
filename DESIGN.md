@@ -363,7 +363,10 @@ identity in `pg_stat_activity` and logs, independent rotation, and revoking it d
    commented out of its `--use-list`.
 5. **Parallel data load.** N workers, one `COPY <table> FROM STDIN` each, scheduled
    largest-object-first so workers finish together. No FKs or triggers exist yet, so order is
-   irrelevant and there is no contention.
+   irrelevant and there is no contention. Tables an extension owns (postgis's
+   `spatial_ref_sys`) are excluded on both ends — the export sweep skips them, and the load
+   skips any an older snapshot still carries — because `CREATE EXTENSION` in step 4 already
+   populated them.
 6. `setval` for every sequence from the manifest.
 7. `pg_restore --section=post-data -j N` — concurrent index builds and FK validation scans.
    This is where parallelism actually pays.
@@ -431,7 +434,8 @@ COPY migrate.sh /app/migrate.sh
 ```
 
 `MIGRATE_COMMAND` names the command -- a pipeline, or the path to a script baked into the image.
-`POSTGRES_URL` and `DATABASE_URL` are both set to `restored_<id>` while it runs, and a non-zero
+`POSTGRES_URL` and `DATABASE_URL` are both set to `restored_<id>` while it runs, `OWNER_ROLE` to
+the resolved owner role so a hook can `SET ROLE` to match `pg_restore --role`, and a non-zero
 exit aborts the restore before the swap.
 
 There is deliberately no conventional hook path. A script is a perfectly good migration step, but

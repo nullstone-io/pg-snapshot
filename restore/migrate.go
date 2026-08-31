@@ -23,6 +23,10 @@ type Migrator struct {
 	// DatabaseURL points at the staging database and is exported to the command
 	DatabaseURL string
 
+	// Owner is exported as OWNER_ROLE, so a hook can SET ROLE to it and leave migration-created
+	// objects owned like everything pg_restore created
+	Owner string
+
 	Log *slog.Logger
 }
 
@@ -43,15 +47,19 @@ func (m Migrator) Run(ctx context.Context) error {
 	log.Info("running migrations", "command", m.Command)
 	cmd := exec.CommandContext(ctx, "sh", "-c", m.Command)
 
-	// The command's only contract. Everything else it needs, it already has from the image.
+	// The command's whole contract. Everything else it needs, it already has from the image.
 	//
-	// Both names are set: POSTGRES_URL because that is what Nullstone publishes and what the app's
-	// own environment already uses, DATABASE_URL because most migration tools look for that. Both
-	// point at the staging database, deliberately shadowing the app's own POSTGRES_URL -- which
-	// points at the admin database and is not where migrations belong.
+	// Both URL names are set: POSTGRES_URL because that is what Nullstone publishes and what the
+	// app's own environment already uses, DATABASE_URL because most migration tools look for that.
+	// Both point at the staging database, deliberately shadowing the app's own POSTGRES_URL --
+	// which points at the admin database and is not where migrations belong.
+	//
+	// OWNER_ROLE carries the *resolved* owner: the deployment may only set the RESTORE_OWNER_ROLE
+	// alias, or nothing at all, and the hook should not have to reimplement that resolution.
 	cmd.Env = append(os.Environ(),
 		"POSTGRES_URL="+m.DatabaseURL,
 		"DATABASE_URL="+m.DatabaseURL,
+		"OWNER_ROLE="+m.Owner,
 	)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr

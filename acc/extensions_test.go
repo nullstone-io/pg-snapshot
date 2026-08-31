@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/nullstone-io/pg-snapshot/export"
 	"github.com/nullstone-io/pg-snapshot/pg"
 	"github.com/nullstone-io/pg-snapshot/restore"
 	"github.com/stretchr/testify/assert"
@@ -185,6 +186,47 @@ func TestExtensionsRestoreAsSessionRole(t *testing.T) {
 		`SELECT tableowner FROM pg_tables
 		 WHERE schemaname = 'public' AND tablename = 'widgets'`).Scan(&tableOwner))
 	assert.Equal(t, owner, tableOwner, "everything else still belongs to the owner role")
+}
+
+// A table an extension owns -- postgis's spatial_ref_sys, canonically -- is populated by CREATE
+// EXTENSION itself, so it must be left out on both ends: the exporter's sweep and, for snapshots
+// taken before the exporter did that, the restore's load. ALTER EXTENSION ADD TABLE creates the
+// same 'e' dependency postgis's tables carry, without needing postgis in the test image.
+func TestExtensionOwnedTablesAreExcluded(t *testing.T) {
+	pool, ctx := Connect(t)
+
+	db := "pgsnap_acc_extowned"
+	drop := func() { pool.Exec(ctx, fmt.Sprintf(`DROP DATABASE IF EXISTS %s WITH (FORCE)`, db)) }
+	drop()
+	t.Cleanup(drop)
+	require.NoError(t, execAll(ctx, pool, fmt.Sprintf(`CREATE DATABASE %s`, db)))
+
+	dbURL, err := withDatabase(URL(), db)
+	require.NoError(t, err)
+	dbPool, err := pg.Open(ctx, dbURL, 1)
+	require.NoError(t, err)
+	defer dbPool.Close()
+
+	require.NoError(t, execAll(ctx, dbPool,
+		`CREATE EXTENSION IF NOT EXISTS pgcrypto`,
+		`CREATE TABLE public.ext_owned (id int PRIMARY KEY)`,
+		`ALTER EXTENSION pgcrypto ADD TABLE public.ext_owned`,
+		`CREATE TABLE public.widgets (id int PRIMARY KEY)`,
+	))
+
+	tables, err := export.Introspector{DB: dbPool}.Tables(ctx)
+	require.NoError(t, err)
+	names := make([]string, 0, len(tables))
+	for _, tb := range tables {
+		names = append(names, tb.Qualified())
+	}
+	assert.Contains(t, names, "public.widgets")
+	assert.NotContains(t, names, "public.ext_owned", "the exporter must not sweep up extension members")
+
+	owned, err := restore.ExtensionTables(ctx, dbPool)
+	require.NoError(t, err)
+	assert.True(t, owned["public.ext_owned"], "the restore must recognise extension members to skip their load")
+	assert.False(t, owned["public.widgets"])
 }
 
 func execAll(ctx context.Context, pool *pgxpool.Pool, stmts ...string) error {

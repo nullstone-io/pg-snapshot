@@ -214,6 +214,27 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 	defer stagingPool.Close()
 
 	if err := phases.Run(ctx, "load data", func() error {
+		// Older snapshots carry tables that belong to an extension here (spatial_ref_sys, most
+		// famously), and CREATE EXTENSION during the schema restore already populated those.
+		owned, err := ExtensionTables(ctx, stagingPool)
+		if err != nil {
+			return err
+		}
+		entries := make([]export.TableEntry, 0, len(manifest.Tables))
+		var skipped []string
+		for _, e := range manifest.Tables {
+			if owned[e.Qualified()] {
+				skipped = append(skipped, e.Qualified())
+				continue
+			}
+			entries = append(entries, e)
+		}
+		if len(skipped) > 0 {
+			log.Warn("skipping tables an extension owns on the target", "tables", skipped,
+				"reason", "CREATE EXTENSION populated them for the target's own version; "+
+					"rows added to them at the source are not carried")
+		}
+
 		loader := Loader{
 			Pool:    stagingPool,
 			Store:   opts.Store,
@@ -221,7 +242,7 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 			Workers: opts.Workers,
 			Log:     log,
 		}
-		if err := loader.Load(ctx, manifest.Tables); err != nil {
+		if err := loader.Load(ctx, entries); err != nil {
 			return err
 		}
 		return ApplySequences(ctx, stagingPool, manifest.Sequences, log)
@@ -246,6 +267,7 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 			return Migrator{
 				Command:     opts.MigrateCommand,
 				DatabaseURL: stagingURL,
+				Owner:       opts.Owner,
 				Log:         log,
 			}.Run(ctx)
 		}, "command", opts.MigrateCommand); err != nil {
