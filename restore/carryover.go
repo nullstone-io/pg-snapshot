@@ -67,7 +67,7 @@ func (c Carryover) applyAcls(ctx context.Context, from, to string) error {
 // database-level privileges are meaningful here; anything else in the string belongs to a
 // different object type and is ignored rather than guessed at.
 func grantFromAclItem(item, database string) (string, bool) {
-	grantee, rest, ok := strings.Cut(item, "=")
+	grantee, rest, ok := splitAclGrantee(item)
 	if !ok {
 		return "", false
 	}
@@ -105,6 +105,34 @@ func grantFromAclItem(item, database string) (string, bool) {
 		sq += " WITH GRANT OPTION"
 	}
 	return sq, true
+}
+
+// splitAclGrantee separates the grantee from the rest of an aclitem.
+//
+// aclitem output quotes a grantee that needs it (hyphens, capitals, ...) and doubles any embedded
+// quote, so the name must be unquoted here or it gets re-quoted into a role that does not exist.
+// A quoted grantee may also contain "=", which is why a plain Cut on "=" is not enough.
+func splitAclGrantee(item string) (grantee, rest string, ok bool) {
+	if !strings.HasPrefix(item, `"`) {
+		return strings.Cut(item, "=")
+	}
+	var name strings.Builder
+	for i := 1; i < len(item); i++ {
+		if item[i] != '"' {
+			name.WriteByte(item[i])
+			continue
+		}
+		if i+1 < len(item) && item[i+1] == '"' {
+			name.WriteByte('"')
+			i++
+			continue
+		}
+		if i+1 < len(item) && item[i+1] == '=' {
+			return name.String(), item[i+2:], true
+		}
+		return "", "", false
+	}
+	return "", "", false
 }
 
 const settingsSql = `

@@ -39,10 +39,30 @@ func TestGrantFromAclItem(t *testing.T) {
 			ok:   true,
 		},
 		{
+			// aclitem output quotes a grantee that needs it; the quotes are not part of the name
 			name: "role name needing quotes",
-			item: `some-role=c/postgres`,
-			want: `GRANT CONNECT ON DATABASE "core" TO "some-role"`,
+			item: `"patterniq-devops-previews-poc-4412885477"=Tc/postgres`,
+			want: `GRANT TEMPORARY, CONNECT ON DATABASE "core" TO "patterniq-devops-previews-poc-4412885477"`,
 			ok:   true,
+		},
+		{
+			// Embedded quotes come doubled inside the quoted grantee
+			name: "role name containing a quote",
+			item: `"we""ird"=c/postgres`,
+			want: `GRANT CONNECT ON DATABASE "core" TO "we""ird"`,
+			ok:   true,
+		},
+		{
+			// An "=" inside a quoted grantee must not be mistaken for the separator
+			name: "role name containing equals",
+			item: `"a=b"=c/postgres`,
+			want: `GRANT CONNECT ON DATABASE "core" TO "a=b"`,
+			ok:   true,
+		},
+		{
+			name: "unterminated quoted grantee",
+			item: `"broken=c/postgres`,
+			ok:   false,
 		},
 		{
 			// Privileges of other object types carry letters that mean nothing on a database
