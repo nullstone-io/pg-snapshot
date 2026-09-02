@@ -175,3 +175,27 @@ func TestCreatedBy(t *testing.T) {
 	assert.Empty(t, staging.createdBy("app", "public", "T", target),
 		"types are carried as a rule only")
 }
+
+// A non-superuser cannot act for a superuser, and every managed platform's reserved role is one.
+// The statements that need such a role have to be dropped as a unit, with the rest untouched.
+func TestPlanWithout(t *testing.T) {
+	plan := PrivilegePlan{
+		Statements: []Statement{
+			{SQL: "GRANT USAGE ON SCHEMA public TO reader", Owner: "rdsadmin", Object: "schema public"},
+			{SQL: "GRANT SELECT ON TABLE orders TO reader", Owner: "app", Object: "table public.orders"},
+			{SQL: "GRANT SELECT ON TABLE rds_tools TO reader", Owner: "rdsadmin", Object: "table public.rds_tools"},
+		},
+		Owners:  []string{"app", "rdsadmin"},
+		Skipped: []string{"table public.dropped"},
+	}
+
+	kept, unreachable := plan.without(map[string]bool{"rdsadmin": true})
+	assert.Equal(t, []Statement{plan.Statements[1]}, kept.Statements)
+	assert.Equal(t, []string{"app"}, kept.Owners, "a role no statement needs must not be borrowed")
+	assert.Equal(t, []string{"schema public", "table public.rds_tools"}, unreachable)
+	assert.Equal(t, plan.Skipped, kept.Skipped)
+
+	same, none := plan.without(nil)
+	assert.Equal(t, plan, same)
+	assert.Nil(t, none)
+}

@@ -3,7 +3,7 @@
 Scrubbed production Postgres snapshots, restored into lower environments.
 
 `pgsnap` exports a production database with sensitive columns transformed **during** the export,
-writes the result to object storage, and restores it into a target environment — reconciling
+writes the result to object storage, and restores it into a target environment, reconciling
 schema drift and swapping the result into place with a short, recoverable cutover.
 
 Sensitive values never enter the snapshot artifact. They are scrubbed in the `SELECT` projection
@@ -23,11 +23,11 @@ production                     bucket                target environment
 ```
 
 Foreign keys and triggers live in `pg_dump`'s `post-data` section, so they are created *after*
-the data lands. Restoring into a fresh database means there is nothing to disable — no
+the data lands. Restoring into a fresh database means there is nothing to disable: no
 `session_replication_role`, and therefore no superuser requirement.
 
 Snapshots are filed under the database they were exported from, `<database>/<timestamp>/`, and a
-restore looks under the target's name. Set `SOURCE_DATABASE` when the two differ — restoring
+restore looks under the target's name. Set `SOURCE_DATABASE` when the two differ, such as restoring
 production's `patterniq` into a preview environment's `patterniq_poc2`.
 
 ## Scrub configuration
@@ -56,8 +56,8 @@ Builtins are `null`, `md5`, `email`, and `redact`. Anything else is passed to Po
 SQL expression.
 
 `md5` and `email` are deterministic within a run and salted per run, so a value scrubbed in one
-table matches the same value scrubbed in another — foreign keys over scrubbed columns still
-resolve — while hashes are not comparable across snapshots.
+table matches the same value scrubbed in another (foreign keys over scrubbed columns still
+resolve), while hashes are not comparable across snapshots.
 
 A rule naming a column that no longer exists fails the snapshot. A rule the user wrote either
 applies or is reported; silently not applying is the one outcome worse than no rule at all.
@@ -69,11 +69,11 @@ Row filtering with `where` can orphan child rows and break foreign key creation 
 
 | mode | rows | structure | needs `SELECT` on the table |
 |---|---|---|---|
-| `skip-data` | no | yes — restores empty | **yes** |
-| `skip` | no | no — not in the artifact | no |
+| `skip-data` | no | yes, restores empty | **yes** |
+| `skip` | no | no, not in the artifact | no |
 
 The privilege column is the whole reason there are two. `pg_dump` takes an `ACCESS SHARE` lock on
-every table it dumps, `--schema-only` included, and that lock requires `SELECT` on the table — so a
+every table it dumps, `--schema-only` included, and that lock requires `SELECT` on the table, so a
 table the snapshot role cannot read fails the schema dump for the *entire* database, in one
 `LOCK TABLE` naming every table at once:
 
@@ -84,11 +84,11 @@ pg_dump: detail: Query was: LOCK TABLE public.users, public.events, … IN ACCES
 
 `mode: skip` passes `--exclude-table` for that table, so `pg_dump` never asks for it and never
 locks it. `mode: skip-data` does not and cannot: it keeps the table's structure, which only
-`pg_dump` can produce. Grant the read, or exclude the table — those are the two options, and
+`pg_dump` can produce. Grant the read, or exclude the table: those are the two options, and
 preflight says which one applies before anything moves.
 
 Excluding a table removes it from the restored database entirely, so anything left behind that
-refers to it — a foreign key on a table that *is* exported, a view, a SQL-bodied function — would
+refers to it (a foreign key on a table that *is* exported, a view, a SQL-bodied function) would
 fail on restore. Preflight names those dependents and refuses the snapshot rather than writing an
 artifact that cannot be loaded.
 
@@ -103,24 +103,24 @@ tables:
 
 `tail_rows: n` exports approximately the **newest** `n` rows of a table instead of all of them,
 located by physical heap position rather than by any column. It exists for the table `where`
-cannot afford: a large append-only table — an events log, say — with no index on its timestamp.
+cannot afford: a large append-only table (an events log, say) with no index on its timestamp.
 There, `where: "created_at > …"` seq-scans the entire table inside the export's long-lived
 transaction, and `ORDER BY created_at DESC LIMIT n` adds a full sort that can exhaust the source's
 temp disk. The tail export instead measures the heap's size and the live-row density of its last
-pages, then copies only a computed window of trailing pages with a `ctid` range predicate —
+pages, then copies only a computed window of trailing pages with a `ctid` range predicate,
 reading megabytes where the alternatives read the whole table.
 
 Three things to know:
 
 - **It assumes append-only.** "The end of the heap is the newest data" holds for insert-only
   tables and degrades silently if the table starts taking heavy `UPDATE` traffic or is
-  `VACUUM FULL`'d — reclaimed space early in the heap absorbs new rows. Name a
+  `VACUUM FULL`'d: reclaimed space early in the heap absorbs new rows. Name a
   `tail_report_column` and watch the reported window in the manifest: a range that stops looking
   recent is the symptom.
 - **It overshoots on purpose.** The window is sized with a margin, so the export lands somewhat
   *over* `n` (a few percent at small `n`, more at very large `n`) rather than ever under it. A
-  probe that finds no live rows in the tail falls back to exporting the whole table — loudly,
-  never to a silent empty export — and a run that still comes back short of `n` (possible when
+  probe that finds no live rows in the tail falls back to exporting the whole table (loudly,
+  never to a silent empty export), and a run that still comes back short of `n` (possible when
   the window is wider than the probed pages) is logged as a warning.
 - **It is a row filter, exactly like `where`.** Rows in other tables that reference excluded rows
   become orphans, and FK creation on restore fails unless `fk_mode: not_valid` is set.
@@ -165,20 +165,20 @@ SOURCE_DATABASE                       only when the snapshot came from a
 BACKUP_RETENTION                      previous targets to keep (default 1)
 ```
 
-Run it with `restore` — the image's entrypoint is already `pgsnap`.
+Run it with `restore`; the image's entrypoint is already `pgsnap`.
 
 ### Cross-account bucket access
 
 Snapshots live in a production bucket and the restore runs somewhere else, so the grant spans two
 accounts. `aws-s3-access` and `gcp-gcs-access` only write the half that lives in the restore's own
 account; the other half is on the bucket, in production, where Terraform running in a lower
-environment has no reach. `gcp-gcs-access` is explicit about it — it skips the IAM binding entirely
+environment has no reach. `gcp-gcs-access` is explicit about it: it skips the IAM binding entirely
 when the app and the bucket are in different projects.
 
 Run the matching command below **once, against the bucket's account or project**.
 
 Grant reads and nothing else. The restore fetches objects, and lists prefixes to find the newest
-snapshot when `SNAPSHOT` is unset. It never writes to the bucket and never deletes from it —
+snapshot when `SNAPSHOT` is unset. It never writes to the bucket and never deletes from it;
 pruning old snapshots is the snapshot side's job, running in production where the bucket already is.
 
 #### AWS
@@ -190,7 +190,7 @@ whatever is already there:
 aws s3api get-bucket-policy --bucket "$BUCKET" --query Policy --output text > bucket-policy.json
 ```
 
-A `NoSuchBucketPolicy` error means there is no policy yet — start from
+A `NoSuchBucketPolicy` error means there is no policy yet; start from
 `{"Version": "2012-10-17", "Statement": []}`.
 
 Add this statement, using the restore app's IAM role ARN:
@@ -217,7 +217,7 @@ aws s3api put-bucket-policy --bucket "$BUCKET" --policy file://bucket-policy.jso
 ```
 
 If the bucket is encrypted with SSE-KMS under a customer-managed key, the key policy needs the same
-principal — a bucket policy alone leaves you with `AccessDenied` on `GetObject` and nothing to
+principal: a bucket policy alone leaves you with `AccessDenied` on `GetObject` and nothing to
 suggest why:
 
 ```bash
@@ -260,7 +260,7 @@ its own service agent, so the reader never touches the key.
 ### Privileges
 
 The snapshot is dumped and restored `--no-acl`, so production's role names never enter the
-artifact — and the restored database starts with no grants beyond what ownership confers. Every
+artifact, and the restored database starts with no grants beyond what ownership confers. Every
 grant the environment's other consumers hold is read from the target on the same instance and
 replayed onto the restored database before the swap: schema `USAGE`, table and sequence
 privileges, column-level grants, `EXECUTE`, and `ALTER DEFAULT PRIVILEGES` rules. Database-level
@@ -270,27 +270,29 @@ Two rules decide what an object receives:
 
 - An object that exists in both gets exactly the target's grants on it. A column-level `SELECT`
   stays a column-level `SELECT`.
-- An object only the restored database has — a migration created it — gets what the target's
+- An object only the restored database has, because a migration created it, gets what the target's
   default privileges would have given it at creation.
 
 The default-privilege rules themselves are carried too, so tables created after the restore keep
 working without anyone re-running the grants.
 
-Grants are copied, revocations are not: a privilege postgres grants by default — `EXECUTE` on a
-function to `PUBLIC`, `USAGE` on a type — that the target had revoked comes back in the restored
-environment. Grants on objects the restored schema does not have are logged and skipped.
+Grants are copied, revocations are not: a privilege postgres grants by default (`EXECUTE` on a
+function to `PUBLIC`, `USAGE` on a type) that the target had revoked comes back in the restored
+environment. Grants on objects the restored schema does not have are logged and skipped, as are grants on
+objects owned by a superuser (the platform-reserved `rdsadmin`, `cloudsqladmin` or `azuresu`), since
+the restore role cannot act for one.
 
 ### Logical replication
 
 The swap replaces the target by renaming, and everything bound to the old database's OID goes with
 it. That includes the environment's replication setup, so a restore would otherwise break whatever
-was replicating out of it — Datastream, a warehouse feed, a downstream subscriber.
+was replicating out of it: Datastream, a warehouse feed, a downstream subscriber.
 
 Both halves are carried automatically. Set `RESTORE_REPLICATION=off` to skip it.
 
 **Publications** are copied from the target onto the staging database before the swap, using
 `pg_dump`, so `publish` parameters, `publish_via_partition_root`, column lists and row filters all
-survive exactly. This is the environment's *own* publication — production's are excluded from the
+survive exactly. This is the environment's *own* publication; production's are excluded from the
 snapshot entirely, because production's replication topology has no business running in a lower
 environment.
 
@@ -302,7 +304,7 @@ A publication naming a table the restored schema does not have fails the restore
 leaving the target untouched.
 
 **Replication slots** are recreated after the swap. A slot is bound to a database OID, so the rename
-leaves it pointing at the backup, and there is no operation that rebinds one — a consumer
+leaves it pointing at the backup, and there is no operation that rebinds one; a consumer
 reconnecting to the target by name is told `replication slot "…" was not created in this database`.
 The restore drops the orphan and creates a fresh slot with the same name and plugin.
 
@@ -312,7 +314,7 @@ cannot be recreated is logged as an error and the restore still succeeds.
 Two things to know:
 
 - The restore role needs the `REPLICATION` attribute. It is not inherited through role membership,
-  so holding `cloudsqlsuperuser` or `alloydbsuperuser` is not enough — the restore-access
+  so holding `cloudsqlsuperuser` or `alloydbsuperuser` is not enough; the restore-access
   capabilities grant it directly. A restore warns before the swap if it is missing.
 - **A recreated slot starts at the current LSN.** Position is not transferable, and would be
   meaningless anyway: the restore replaced every row. Downstream needs a backfill after each restore.
@@ -334,7 +336,7 @@ snapshot uses artifact version 2, this build understands 1;
 upgrade the restore module to match the snapshot module
 ```
 
-The same check covers Postgres versions in the other direction — a dump cannot be restored into an
+The same check covers Postgres versions in the other direction: a dump cannot be restored into an
 older major, and the manifest records which one it came from.
 
 ## Development

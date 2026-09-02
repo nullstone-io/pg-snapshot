@@ -76,17 +76,36 @@ func (p Privileges) Carry(ctx context.Context, from, to *pgxpool.Pool) error {
 	// Granting on an object requires owning it (or holding the privilege WITH GRANT OPTION), and
 	// ALTER DEFAULT PRIVILEGES FOR ROLE requires membership in that role. A superuser needs neither.
 	if !info.superuser {
+		// A non-superuser cannot be granted membership in a superuser, on any platform: that is
+		// what every managed service's reserved role is (rdsadmin, cloudsqladmin, azuresu), and
+		// RDS only adds a friendlier error. Grants on what such a role owns are provably out of
+		// reach, so they are skipped rather than failing the restore.
+		reserved, err := superusersAmong(ctx, to, plan.Owners)
+		if err != nil {
+			return err
+		}
+		plan = p.dropUnreachable(plan, reserved, info.user+" is not a superuser and cannot act for one")
+
 		held, err := borrowRoles(ctx, to, info.user, plan.Owners, p.log())
 		defer held.release(ctx)
 		if err != nil {
 			return fmt.Errorf("%s could not acquire the privileges needed to carry grants: %w",
 				info.user, err)
 		}
+		// The catalog check above is the explanation; postgres refusing the grant is the proof. A
+		// platform that reserves a role some other way lands here, and the outcome is the same.
+		if len(held.unavailable) > 0 {
+			refused := map[string]bool{}
+			for _, role := range held.unavailable {
+				refused[role] = true
+			}
+			plan = p.dropUnreachable(plan, refused, "postgres refused to grant the role to "+info.user)
+		}
 	}
 
-	for _, sq := range plan.Statements {
-		if _, err := to.Exec(ctx, sq); err != nil {
-			return fmt.Errorf("error carrying privileges: %s: %w", sq, err)
+	for _, s := range plan.Statements {
+		if _, err := to.Exec(ctx, s.SQL); err != nil {
+			return fmt.Errorf("error carrying privileges: %s: %w", s.SQL, err)
 		}
 	}
 
@@ -96,7 +115,7 @@ func (p Privileges) Carry(ctx context.Context, from, to *pgxpool.Pool) error {
 
 // PrivilegePlan is every statement a carry will run, worked out before any of them does.
 type PrivilegePlan struct {
-	Statements []string
+	Statements []Statement
 
 	// Owners are the roles whose privileges the statements need: the owners of every object being
 	// granted on, and the role of every default-privilege rule
@@ -104,6 +123,69 @@ type PrivilegePlan struct {
 
 	// Skipped are target objects carrying grants that staging does not have
 	Skipped []string
+}
+
+// Statement is one GRANT or ALTER DEFAULT PRIVILEGES, with the role whose privileges running it
+// needs and the object it is for.
+type Statement struct {
+	SQL    string
+	Owner  string
+	Object string
+}
+
+// dropUnreachable removes the statements that need any of the given roles and says which objects
+// lost their grants because of it. Grants on what such a role owns are provably out of reach, so
+// they are skipped rather than failing the restore.
+func (p Privileges) dropUnreachable(plan PrivilegePlan, roles map[string]bool, reason string) PrivilegePlan {
+	kept, unreachable := plan.without(roles)
+	if len(unreachable) > 0 {
+		p.log().Warn("grants on objects owned by a role the restore cannot act for were not carried",
+			"owners", sortedKeys(roles), "objects", unreachable, "reason", reason)
+	}
+	return kept
+}
+
+// without drops every statement that needs one of the given roles, reporting the objects that
+// lost their grants as a result.
+func (p PrivilegePlan) without(roles map[string]bool) (PrivilegePlan, []string) {
+	if len(roles) < 1 {
+		return p, nil
+	}
+	kept := PrivilegePlan{Skipped: p.Skipped}
+	owners := map[string]bool{}
+	dropped := map[string]bool{}
+	for _, s := range p.Statements {
+		if roles[s.Owner] {
+			dropped[s.Object] = true
+			continue
+		}
+		kept.Statements = append(kept.Statements, s)
+		owners[s.Owner] = true
+	}
+	kept.Owners = sortedKeys(owners)
+	return kept, sortedKeys(dropped)
+}
+
+// superusersAmong reports which of the roles are superusers.
+func superusersAmong(ctx context.Context, db pg.Querier, roles []string) (map[string]bool, error) {
+	out := map[string]bool{}
+	if len(roles) < 1 {
+		return out, nil
+	}
+	rows, err := db.Query(ctx,
+		`SELECT rolname FROM pg_catalog.pg_roles WHERE rolsuper AND rolname = ANY($1)`, roles)
+	if err != nil {
+		return nil, fmt.Errorf("error reading role attributes: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, fmt.Errorf("error reading role attributes: %w", err)
+		}
+		out[name] = true
+	}
+	return out, rows.Err()
 }
 
 // Plan reads both catalogs and renders the statements Carry would run, without running them.
@@ -124,17 +206,18 @@ func (p Privileges) Plan(ctx context.Context, from, to pg.Querier) (PrivilegePla
 	// Resolved once here rather than in every statement: pg_database_owner owns the public schema
 	// in every database and cannot be granted to anyone, so membership has to be borrowed from the
 	// role it currently stands for
-	own := func(role string) {
+	resolve := func(role string) string {
 		if role == "pg_database_owner" {
-			role = dest.DatabaseOwner
+			return dest.DatabaseOwner
 		}
-		owners[role] = true
+		return role
 	}
 
-	add := func(owner string, statements []string) {
-		if len(statements) > 0 {
-			plan.Statements = append(plan.Statements, statements...)
-			own(owner)
+	add := func(owner, object string, statements []string) {
+		owner = resolve(owner)
+		for _, sq := range statements {
+			plan.Statements = append(plan.Statements, Statement{SQL: sq, Owner: owner, Object: object})
+			owners[owner] = true
 		}
 	}
 
@@ -148,7 +231,8 @@ func (p Privileges) Plan(ctx context.Context, from, to pg.Querier) (PrivilegePla
 			skipped = append(skipped, "schema "+s.Name)
 			continue
 		}
-		add(d.Owner, grantStatements(s.Acl, d.Owner, schemaPrivs, "", "SCHEMA "+quoteName(s.Name, "")))
+		add(d.Owner, "schema "+s.Name,
+			grantStatements(s.Acl, d.Owner, schemaPrivs, "", "SCHEMA "+quoteName(s.Name, "")))
 	}
 
 	// Default privileges next, in both of their forms: the rule itself, so objects created after the
@@ -165,11 +249,15 @@ func (p Privileges) Plan(ctx context.Context, from, to pg.Querier) (PrivilegePla
 				continue
 			}
 			for _, g := range splitGrants(entry, kind.privs, "") {
+				rule := "default privileges of " + d.Role
+				if d.Schema != "" {
+					rule += " in " + d.Schema
+				}
 				statements := []string{g.defaultSql(d.Role, d.Schema, kind.plural)}
 				for _, object := range created {
 					statements = append(statements, g.sql(kind.singular+" "+object))
 				}
-				add(d.Role, statements)
+				add(d.Role, rule, statements)
 			}
 		}
 	}
@@ -184,7 +272,8 @@ func (p Privileges) Plan(ctx context.Context, from, to pg.Querier) (PrivilegePla
 			continue
 		}
 		on := relationKeyword(d.Kind) + " " + quoteName(r.Schema, r.Name)
-		add(d.Owner, grantStatements(r.Acl, d.Owner, relationPrivs(d.Kind), "", on))
+		add(d.Owner, relationDesc(d.Kind)+" "+r.Qualified(),
+			grantStatements(r.Acl, d.Owner, relationPrivs(d.Kind), "", on))
 	}
 
 	for _, c := range source.Columns {
@@ -194,7 +283,8 @@ func (p Privileges) Plan(ctx context.Context, from, to pg.Querier) (PrivilegePla
 			continue
 		}
 		on := "TABLE " + quoteName(c.Schema, c.Name)
-		add(d.Owner, grantStatements(c.Acl, d.Owner, columnPrivs, c.Column, on))
+		add(d.Owner, "column "+c.Qualified()+"."+c.Column,
+			grantStatements(c.Acl, d.Owner, columnPrivs, c.Column, on))
 	}
 
 	for _, r := range source.orderedRoutines() {
@@ -207,7 +297,8 @@ func (p Privileges) Plan(ctx context.Context, from, to pg.Querier) (PrivilegePla
 			continue
 		}
 		on := "ROUTINE " + quoteName(r.Schema, r.Name) + "(" + r.Args + ")"
-		add(d.Owner, grantStatements(r.Acl, d.Owner, routinePrivs, "", on))
+		add(d.Owner, "routine "+r.Signature(),
+			grantStatements(r.Acl, d.Owner, routinePrivs, "", on))
 	}
 
 	plan.Owners = sortedKeys(owners)

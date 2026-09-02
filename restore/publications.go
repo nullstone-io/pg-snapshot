@@ -174,6 +174,11 @@ func (p Publications) create(ctx context.Context, to *pgxpool.Pool, pub Publicat
 			return fmt.Errorf("%s could not acquire the privileges needed to create publication %q: %w",
 				info.user, pub.Name, err)
 		}
+		// A publication cannot be half-created, so a role that could not be borrowed is fatal here
+		if len(held.unavailable) > 0 {
+			return fmt.Errorf("%s cannot act for %v, which creating publication %q requires",
+				info.user, held.unavailable, pub.Name)
+		}
 	}
 
 	sq := CreatePublicationSql(pub)

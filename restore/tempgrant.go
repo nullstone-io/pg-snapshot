@@ -2,10 +2,12 @@ package restore
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/lib/pq"
 	"github.com/nullstone-io/pg-snapshot/pg"
@@ -25,6 +27,10 @@ type tempMembership struct {
 	roles []string
 	user  string
 	log   *slog.Logger
+
+	// unavailable are the roles postgres refused to grant: a superuser, or a role the platform
+	// reserves. Recorded rather than fatal, because what to do about it depends on the caller.
+	unavailable []string
 }
 
 // borrowRoles acquires the privileges of every role named, and returns a handle that gives them
@@ -78,6 +84,16 @@ func borrowRoles(ctx context.Context, pool *pgxpool.Pool, user string, roles []s
 		sq := fmt.Sprintf("GRANT %s TO %s WITH INHERIT TRUE",
 			pq.QuoteIdentifier(role), pq.QuoteIdentifier(user))
 		if _, err := held.pool.Exec(ctx, sq); err != nil {
+			// insufficient_privilege is postgres saying the membership can never be granted by this
+			// user -- a superuser, or a role the platform reserves (RDS refuses rdsadmin with its own
+			// message under the same code). Asking postgres is the one check that holds on every
+			// platform, so the role is recorded and the caller decides what its absence costs.
+			var pgErr *pgconn.PgError
+			if errors.As(err, &pgErr) && pgErr.Code == "42501" {
+				log.Warn("role cannot be borrowed", "role", role, "user", user, "detail", pgErr.Message)
+				held.unavailable = append(held.unavailable, role)
+				continue
+			}
 			return held, fmt.Errorf("error granting %q to %q: %w", role, user, err)
 		}
 		held.roles = append(held.roles, role)
