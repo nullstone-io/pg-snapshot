@@ -462,6 +462,13 @@ The swap substitutes a different database, and the artifact it was built from ca
   an object only staging has, because a migration created it, gets what the target's default
   privileges would have given it at creation. Grants are copied, revocations of built-in
   defaults are not.
+- Global `pg_default_acl` rules are the exception to "before the swap, after the load": they are
+  applied to staging *before* the schema restore. A rule attaches at creation, so applied first it
+  covers every object `pg_restore` and the migration step create, the way it did in the target.
+  This is the mechanism `postgres-access` relies on — each application's rule grants the database
+  owner everything it creates — and carrying it early is what keeps the restored environment
+  reachable even when the restore's owner role is not the role the applications inherit from.
+  Schema-scoped rules need their schema to exist and are applied after the load instead.
 
 Reading from the target rather than the artifact is what keeps §6 intact: production's role
 names still never leave production, and every grantee provably exists on the instance.

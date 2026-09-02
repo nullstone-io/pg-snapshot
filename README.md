@@ -274,7 +274,14 @@ Two rules decide what an object receives:
   default privileges would have given it at creation.
 
 The default-privilege rules themselves are carried too, so tables created after the restore keep
-working without anyone re-running the grants.
+working without anyone re-running the grants. Global rules (no `IN SCHEMA`) are carried *before*
+the schema restore, because a rule attaches to objects as they are created: every table `pg_restore`
+and your migration step create comes out already holding the grants the rule describes, exactly as
+it would have in the target. This is the shape `postgres-access` sets up, where each application's
+rule grants the database owner everything the application creates, and it is what keeps the
+restored environment working when objects are created by a role other than the one the
+applications inherit from. Rules scoped to a schema wait until the schema exists and are applied
+after the load, by hand to what a migration created.
 
 Grants are copied, revocations are not: a privilege postgres grants by default (`EXECUTE` on a
 function to `PUBLIC`, `USAGE` on a type) that the target had revoked comes back in the restored

@@ -99,11 +99,12 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 	}
 	defer admin.Unlock(context.WithoutCancel(ctx), opts.Target)
 
-	// Eight phases always run: recover, select snapshot, restore schema, load data, restore
-	// constraints, carry privileges, analyze, swap. The rest depend on configuration, which is why
-	// the total is worked out here rather than declared as a list -- and why the phase logger drops
-	// the denominator rather than printing "9 of 8" if this arithmetic is ever wrong.
-	total := 8
+	// Nine phases always run: recover, select snapshot, carry default privileges, restore schema,
+	// load data, restore constraints, carry privileges, analyze, swap. The rest depend on
+	// configuration, which is why the total is worked out here rather than declared as a list --
+	// and why the phase logger drops the denominator rather than printing "10 of 9" if this
+	// arithmetic is ever wrong.
+	total := 9
 	if opts.MigrateCommand != "" {
 		total++
 	}
@@ -172,6 +173,34 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
+	stagingPool, err := pg.Open(ctx, stagingURL, opts.Workers)
+	if err != nil {
+		return nil, err
+	}
+	defer stagingPool.Close()
+
+	// The target is read from here on: its default privileges now, its grants after the load, and
+	// its publications when replication is on. A session of its own rather than the admin pool,
+	// because what is inside a database can only be read from a session connected to it.
+	targetURL, err := pg.WithDatabase(opts.AdminURL, opts.Target)
+	if err != nil {
+		return nil, err
+	}
+	targetPool, err := pg.Open(ctx, targetURL, 1)
+	if err != nil {
+		return nil, err
+	}
+	defer targetPool.Close()
+
+	// Before anything is created in staging, so that everything created from here on -- by
+	// pg_restore and by the migration step alike -- comes out holding the grants the target's
+	// default-privilege rules describe. A rule attaches at creation; applied afterwards it would
+	// cover only what came later.
+	if err := phases.Run(ctx, "carry default privileges", func() error {
+		return (Privileges{Log: log}).CarryDefaults(ctx, targetPool, stagingPool)
+	}, "from", opts.Target, "to", staging); err != nil {
+		return nil, err
+	}
 
 	schemaPath, cleanup, err := fetchSchema(ctx, opts.Store, layout)
 	if err != nil {
@@ -206,12 +235,6 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 	}, "section", pg.SectionPreData, "database", staging); err != nil {
 		return nil, err
 	}
-
-	stagingPool, err := pg.Open(ctx, stagingURL, opts.Workers)
-	if err != nil {
-		return nil, err
-	}
-	defer stagingPool.Close()
 
 	if err := phases.Run(ctx, "load data", func() error {
 		// Older snapshots carry tables that belong to an extension here (spatial_ref_sys, most
@@ -274,19 +297,6 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 			return nil, err
 		}
 	}
-
-	// The target is read from here on: its grants, and its publications when replication is on.
-	// A session of its own rather than the admin pool, because what is inside a database can only
-	// be read from a session connected to it.
-	targetURL, err := pg.WithDatabase(opts.AdminURL, opts.Target)
-	if err != nil {
-		return nil, err
-	}
-	targetPool, err := pg.Open(ctx, targetURL, 1)
-	if err != nil {
-		return nil, err
-	}
-	defer targetPool.Close()
 
 	// Two layers of privileges, split by where postgres keeps them. The database's own ACL and
 	// settings live in shared catalogs and are copied through the admin connection; every grant

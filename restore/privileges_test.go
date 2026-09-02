@@ -199,3 +199,23 @@ func TestPlanWithout(t *testing.T) {
 	assert.Equal(t, plan, same)
 	assert.Nil(t, none)
 }
+
+func TestDefaultRuleStatements(t *testing.T) {
+	global := defaultAcl{Role: "app", Schema: "", ObjType: "r",
+		Acl: []string{"app=arwdDxtm/app", "owner=arwdDxtm/app", "reader=r*/app"}}
+	got := defaultRuleStatements(global)
+	assert.Equal(t, []Statement{
+		{SQL: `ALTER DEFAULT PRIVILEGES FOR ROLE "app" GRANT INSERT, SELECT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER, MAINTAIN ON TABLES TO "owner"`,
+			Owner: "app", Object: "default privileges of app"},
+		{SQL: `ALTER DEFAULT PRIVILEGES FOR ROLE "app" GRANT SELECT ON TABLES TO "reader" WITH GRANT OPTION`,
+			Owner: "app", Object: "default privileges of app"},
+	}, got, "the role's own entry is skipped; the rule needs the role's membership to recreate")
+
+	scoped := defaultAcl{Role: "app", Schema: "public", ObjType: "S", Acl: []string{"reader=U/app"}}
+	assert.Equal(t, `ALTER DEFAULT PRIVILEGES FOR ROLE "app" IN SCHEMA "public" GRANT USAGE ON SEQUENCES TO "reader"`,
+		defaultRuleStatements(scoped)[0].SQL)
+	assert.Equal(t, "default privileges of app in public", defaultRuleStatements(scoped)[0].Object)
+
+	assert.Empty(t, defaultRuleStatements(defaultAcl{Role: "app", ObjType: "?", Acl: []string{"reader=r/app"}}),
+		"an object type this build does not know is ignored rather than guessed at")
+}

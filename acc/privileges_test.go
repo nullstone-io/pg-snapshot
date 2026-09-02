@@ -157,3 +157,72 @@ func TestCarryPrivilegesNothingToCarry(t *testing.T) {
 		Carry(ctx, poolFor(t, ctx, targetURL), poolFor(t, ctx, stagingURL)))
 	assert.NotContains(t, logged.String(), "were not carried")
 }
+
+// A global default-privilege rule attaches to objects as they are created, so carrying it before
+// the schema restore is what makes every restored table come out already granted. This is the
+// production shape: applications' own rules grant the database owner everything they create, and
+// the restored copy has to reproduce that at creation time, not patch it afterwards.
+func TestCarryDefaultsBeforeSchema(t *testing.T) {
+	pool, ctx := Connect(t)
+
+	const owner, reader = "pgsnap_acc_defaults_owner", "pgsnap_acc_defaults_reader"
+
+	target, staging, dropDatabases := twoDatabases(t, ctx, pool, "pgsnap_acc_defaults")
+	dropRoles := func() {
+		for _, r := range []string{owner, reader} {
+			pool.Exec(ctx, fmt.Sprintf(`DROP ROLE IF EXISTS %s`, r))
+		}
+	}
+	dropRoles()
+	t.Cleanup(func() {
+		dropDatabases()
+		dropRoles()
+	})
+
+	require.NoError(t, execAll(ctx, pool,
+		fmt.Sprintf(`CREATE ROLE %s LOGIN PASSWORD 'acc-password'`, owner),
+		fmt.Sprintf(`CREATE ROLE %s LOGIN PASSWORD 'acc-password'`, reader),
+		fmt.Sprintf(`ALTER DATABASE %s OWNER TO %s`, target, owner),
+		fmt.Sprintf(`ALTER DATABASE %s OWNER TO %s`, staging, owner),
+	))
+
+	targetURL, stagingURL := dbURL(t, target), dbURL(t, staging)
+	ownerStagingURL, err := withUser(stagingURL, owner, "acc-password")
+	require.NoError(t, err)
+	readerStagingURL, err := withUser(stagingURL, reader, "acc-password")
+	require.NoError(t, err)
+
+	// The target's rule is global -- no IN SCHEMA -- which is the form postgres-access writes
+	execInDatabase(t, ctx, targetURL,
+		fmt.Sprintf(`ALTER DEFAULT PRIVILEGES FOR ROLE %s GRANT SELECT ON TABLES TO %s`, owner, reader),
+		fmt.Sprintf(`ALTER DEFAULT PRIVILEGES FOR ROLE %s IN SCHEMA public GRANT USAGE ON SEQUENCES TO %s`, owner, reader))
+
+	// Staging is empty, exactly as it is when this phase runs in a restore
+	log, logged := captureLogger()
+	require.NoError(t, (restore.Privileges{Log: log}).
+		CarryDefaults(ctx, poolFor(t, ctx, targetURL), poolFor(t, ctx, stagingURL)))
+	assert.Contains(t, logged.String(), "default privileges carried")
+
+	// Stands in for pg_restore: objects created by the owner after the rule was applied
+	execInDatabase(t, ctx, ownerStagingURL,
+		`CREATE TABLE restored(id int PRIMARY KEY)`,
+		`CREATE SEQUENCE restored_seq`)
+
+	readerPool, err := pg.Open(ctx, readerStagingURL, 1)
+	require.NoError(t, err)
+	defer readerPool.Close()
+
+	var count int
+	require.NoError(t, readerPool.QueryRow(ctx, `SELECT count(*) FROM restored`).Scan(&count),
+		"a table created after the global rule was carried must already be readable")
+
+	var n int64
+	err = readerPool.QueryRow(ctx, `SELECT nextval('restored_seq')`).Scan(&n)
+	require.Error(t, err, "a schema-scoped rule cannot run before the schema restore and must wait for Carry")
+
+	// The later carry picks up the schema-scoped rule, and must not trip over the global one
+	require.NoError(t, (restore.Privileges{Log: log}).
+		Carry(ctx, poolFor(t, ctx, targetURL), poolFor(t, ctx, stagingURL)))
+	require.NoError(t, readerPool.QueryRow(ctx, `SELECT nextval('restored_seq')`).Scan(&n),
+		"the schema-scoped rule is applied by hand to what already exists")
+}

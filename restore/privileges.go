@@ -64,8 +64,46 @@ func (p Privileges) Carry(ctx context.Context, from, to *pgxpool.Pool) error {
 			"reason", "the objects exist in the target but not in the restored database; a "+
 				"migration most likely dropped them")
 	}
+	return p.apply(ctx, to, plan, "privileges")
+}
+
+// CarryDefaults copies the target's global default-privilege rules onto a database nothing has been
+// restored into yet.
+//
+// A rule attaches to objects as they are created, which is why this runs before the schema restore
+// rather than with everything else afterwards: every table pg_restore and the migration step create
+// comes out already holding the grants the rule describes, exactly as it would have in the target.
+// Only global rules can run this early; one scoped IN SCHEMA needs the schema to exist, and Carry
+// applies those after the restore.
+//
+// This is also what keeps an environment working when the restore's owner role is not the role the
+// applications inherit from. In production the applications' own default-privilege rules bridge the
+// two at creation time; applied here, they do the same for the restored copy.
+func (p Privileges) CarryDefaults(ctx context.Context, from, to *pgxpool.Pool) error {
+	defaults, err := readDefaultAcls(ctx, from)
+	if err != nil {
+		return fmt.Errorf("error reading default privileges of the target: %w", err)
+	}
+
+	var plan PrivilegePlan
+	owners := map[string]bool{}
+	for _, d := range defaults {
+		if d.Schema != "" {
+			continue
+		}
+		for _, s := range defaultRuleStatements(d) {
+			plan.Statements = append(plan.Statements, s)
+			owners[s.Owner] = true
+		}
+	}
+	plan.Owners = sortedKeys(owners)
+	return p.apply(ctx, to, plan, "default privileges")
+}
+
+// apply runs a plan's statements on `to`, borrowing the memberships they need first.
+func (p Privileges) apply(ctx context.Context, to *pgxpool.Pool, plan PrivilegePlan, what string) error {
 	if len(plan.Statements) < 1 {
-		p.log().Info("no privileges to carry")
+		p.log().Info("no " + what + " to carry")
 		return nil
 	}
 
@@ -109,7 +147,7 @@ func (p Privileges) Carry(ctx context.Context, from, to *pgxpool.Pool) error {
 		}
 	}
 
-	p.log().Info("privileges carried", "statements", len(plan.Statements), "skipped", len(plan.Skipped))
+	p.log().Info(what+" carried", "statements", len(plan.Statements), "skipped", len(plan.Skipped))
 	return nil
 }
 
@@ -235,10 +273,14 @@ func (p Privileges) Plan(ctx context.Context, from, to pg.Querier) (PrivilegePla
 			grantStatements(s.Acl, d.Owner, schemaPrivs, "", "SCHEMA "+quoteName(s.Name, "")))
 	}
 
-	// Default privileges next, in both of their forms: the rule itself, so objects created after the
-	// restore are covered, and the rule applied by hand to the objects a migration already created
-	// under it
+	// Schema-scoped default privileges next, in both of their forms: the rule itself, so objects
+	// created after the restore are covered, and the rule applied by hand to the objects a
+	// migration already created under it. Global rules are not here: CarryDefaults applied them
+	// before the schema restore, so everything created since already holds them.
 	for _, d := range source.Defaults {
+		if d.Schema == "" {
+			continue
+		}
 		kind, ok := defaultKinds[d.ObjType]
 		if !ok {
 			continue
@@ -679,6 +721,51 @@ LEFT JOIN pg_catalog.pg_namespace n ON n.oid = d.defaclnamespace
 ORDER BY 1, 2, 3`
 )
 
+// defaultRuleStatements renders one pg_default_acl row as the ALTER DEFAULT PRIVILEGES statements
+// that recreate it, one per grantee and grant-option group.
+func defaultRuleStatements(d defaultAcl) []Statement {
+	kind, ok := defaultKinds[d.ObjType]
+	if !ok {
+		return nil
+	}
+	object := "default privileges of " + d.Role
+	if d.Schema != "" {
+		object += " in " + d.Schema
+	}
+
+	out := make([]Statement, 0)
+	for _, entry := range parseAcl(d.Acl) {
+		if entry.Grantee == d.Role {
+			continue
+		}
+		for _, g := range splitGrants(entry, kind.privs, "") {
+			out = append(out, Statement{
+				SQL:    g.defaultSql(d.Role, d.Schema, kind.plural),
+				Owner:  d.Role,
+				Object: object,
+			})
+		}
+	}
+	return out
+}
+
+// readDefaultAcls reads a database's default-privilege rules.
+func readDefaultAcls(ctx context.Context, db pg.Querier) ([]defaultAcl, error) {
+	out := make([]defaultAcl, 0)
+	err := scanRows(ctx, db, defaultsSql, func(rows scanner) error {
+		var d defaultAcl
+		if err := rows.Scan(&d.Role, &d.Schema, &d.ObjType, &d.Acl); err != nil {
+			return err
+		}
+		out = append(out, d)
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("error reading default privileges: %w", err)
+	}
+	return out, nil
+}
+
 // readObjects reads a database's grantable objects and the ACLs on them.
 func readObjects(ctx context.Context, db pg.Querier) (objectSet, error) {
 	set := objectSet{
@@ -744,15 +831,8 @@ func readObjects(ctx context.Context, db pg.Querier) (objectSet, error) {
 		return set, fmt.Errorf("error reading routines: %w", err)
 	}
 
-	if err := scanRows(ctx, db, defaultsSql, func(rows scanner) error {
-		var d defaultAcl
-		if err := rows.Scan(&d.Role, &d.Schema, &d.ObjType, &d.Acl); err != nil {
-			return err
-		}
-		set.Defaults = append(set.Defaults, d)
-		return nil
-	}); err != nil {
-		return set, fmt.Errorf("error reading default privileges: %w", err)
+	if set.Defaults, err = readDefaultAcls(ctx, db); err != nil {
+		return set, err
 	}
 
 	return set, nil
