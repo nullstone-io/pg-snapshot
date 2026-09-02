@@ -187,11 +187,9 @@ func (p Publications) create(ctx context.Context, to *pgxpool.Pool, pub Publicat
 func publicationOwners(ctx context.Context, db pg.Querier, pub Publication) ([]string, error) {
 	owners := make([]string, 0)
 
-	var dbOwner string
-	if err := db.QueryRow(ctx,
-		`SELECT pg_get_userbyid(datdba) FROM pg_database WHERE datname = current_database()`,
-	).Scan(&dbOwner); err != nil {
-		return nil, fmt.Errorf("error reading the database owner: %w", err)
+	dbOwner, err := readDatabaseOwner(ctx, db)
+	if err != nil {
+		return nil, err
 	}
 	owners = append(owners, dbOwner)
 

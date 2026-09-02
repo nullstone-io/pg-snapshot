@@ -447,13 +447,24 @@ table, so the customer's migration tool applies exactly the delta between the pr
 schema and the target environment's. The tracking table must not be excluded in the scrub
 config — the preflight warns if it appears to be.
 
-### 5.5 What does not follow a rename
+### 5.5 What the swap does not carry on its own
 
-These live on the old database's OID and must be reapplied to `restored_<id>` *before* the
-swap, via `pg-db-admin`:
+The swap substitutes a different database, and the artifact it was built from carries no grants
+(`--no-acl`, §6). Everything below is read from the target on the same instance and reapplied to
+`restored_<id>` *before* the swap, so the environment's other consumers keep their access:
 
-- Database ACLs (`GRANT CONNECT ON DATABASE`)
-- Per-database settings (`ALTER DATABASE core SET …`, in `pg_db_role_setting`)
+- Database ACLs (`GRANT CONNECT ON DATABASE`) and per-database settings
+  (`ALTER DATABASE core SET …`, in `pg_db_role_setting`) — these live on the database's own
+  catalog row and are copied through the admin connection (`restore/carryover.go`)
+- Every grant inside the database — schema `USAGE`, relation and column privileges, `EXECUTE`,
+  and `pg_default_acl` rules — read from a session on the target and replayed on staging
+  (`restore/privileges.go`). An object present in both gets the target's ACL entry for entry;
+  an object only staging has, because a migration created it, gets what the target's default
+  privileges would have given it at creation. Grants are copied, revocations of built-in
+  defaults are not.
+
+Reading from the target rather than the artifact is what keeps §6 intact: production's role
+names still never leave production, and every grantee provably exists on the instance.
 
 Ownership is handled at load time — `pg_restore --role=<db-owner>` creates objects correctly
 owned from the start, so `REASSIGN OWNED` is a repair path rather than a step.

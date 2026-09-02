@@ -257,6 +257,29 @@ rather than a read-modify-write, so it is safe to re-run.
 Customer-managed encryption needs no extra grant here, unlike on AWS. Cloud Storage decrypts with
 its own service agent, so the reader never touches the key.
 
+### Privileges
+
+The snapshot is dumped and restored `--no-acl`, so production's role names never enter the
+artifact — and the restored database starts with no grants beyond what ownership confers. Every
+grant the environment's other consumers hold is read from the target on the same instance and
+replayed onto the restored database before the swap: schema `USAGE`, table and sequence
+privileges, column-level grants, `EXECUTE`, and `ALTER DEFAULT PRIVILEGES` rules. Database-level
+`CONNECT` and per-database settings are carried the same way.
+
+Two rules decide what an object receives:
+
+- An object that exists in both gets exactly the target's grants on it. A column-level `SELECT`
+  stays a column-level `SELECT`.
+- An object only the restored database has — a migration created it — gets what the target's
+  default privileges would have given it at creation.
+
+The default-privilege rules themselves are carried too, so tables created after the restore keep
+working without anyone re-running the grants.
+
+Grants are copied, revocations are not: a privilege postgres grants by default — `EXECUTE` on a
+function to `PUBLIC`, `USAGE` on a type — that the target had revoked comes back in the restored
+environment. Grants on objects the restored schema does not have are logged and skipped.
+
 ### Logical replication
 
 The swap replaces the target by renaming, and everything bound to the old database's OID goes with

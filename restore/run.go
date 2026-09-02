@@ -275,8 +275,29 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 		}
 	}
 
-	if err := phases.Run(ctx, "carry database privileges and settings", func() error {
-		return (Carryover{DB: adminPool, Log: log}).Apply(ctx, opts.Target, staging)
+	// The target is read from here on: its grants, and its publications when replication is on.
+	// A session of its own rather than the admin pool, because what is inside a database can only
+	// be read from a session connected to it.
+	targetURL, err := pg.WithDatabase(opts.AdminURL, opts.Target)
+	if err != nil {
+		return nil, err
+	}
+	targetPool, err := pg.Open(ctx, targetURL, 1)
+	if err != nil {
+		return nil, err
+	}
+	defer targetPool.Close()
+
+	// Two layers of privileges, split by where postgres keeps them. The database's own ACL and
+	// settings live in shared catalogs and are copied through the admin connection; every grant
+	// inside the database is read from the target and replayed onto staging. The snapshot carries
+	// neither -- it is dumped --no-acl -- so without this step the environment's other consumers
+	// come up able to connect and unable to read.
+	if err := phases.Run(ctx, "carry privileges and settings", func() error {
+		if err := (Carryover{DB: adminPool, Log: log}).Apply(ctx, opts.Target, staging); err != nil {
+			return err
+		}
+		return (Privileges{Log: log}).Carry(ctx, targetPool, stagingPool)
 	}, "from", opts.Target, "to", staging); err != nil {
 		return nil, err
 	}
@@ -287,21 +308,10 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 	// target is not a name conflict, and a failure here aborts with the target untouched. Slots are
 	// cluster-wide and bound to a database OID, so they cannot be touched until the swap has closed
 	// the old database and made the orphan provably inactive.
-	targetURL, err := pg.WithDatabase(opts.AdminURL, opts.Target)
-	if err != nil {
-		return nil, err
-	}
-
 	var slots []Slot
 	slotter := Slots{Admin: adminPool, Log: log}
 	if opts.Replication {
 		if err := phases.Run(ctx, "carry publications", func() error {
-			targetPool, err := pg.Open(ctx, targetURL, 1)
-			if err != nil {
-				return err
-			}
-			defer targetPool.Close()
-
 			publications := Publications{Log: log}
 			if err := publications.Carry(ctx, targetPool, stagingPool); err != nil {
 				return err
@@ -338,8 +348,10 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 		return nil, err
 	}
 
-	// The pool holds open sessions on the staging database, and an open session blocks its rename
+	// The pools hold open sessions on the staging and target databases, and an open session blocks
+	// a rename
 	stagingPool.Close()
+	targetPool.Close()
 
 	var backup string
 	if err := phases.Run(ctx, "swap", func() error {
